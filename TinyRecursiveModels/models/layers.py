@@ -3,6 +3,7 @@ import einops
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 
 #try:
 #    from flash_attn_interface import flash_attn_func  # type: ignore[import]
@@ -95,6 +96,33 @@ class RotaryEmbedding(nn.Module):
     def forward(self):
         return self.cos_cached, self.sin_cached
 
+class LoRACastedLinear(nn.Module):
+    def __init__(self, base_layer: CastedLinear, r=8, alpha=16, dropout=0.0):
+        super().__init__()
+        self.base = base_layer
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        self.dropout = nn.Dropout(dropout)
+
+        in_features = base_layer.weight.shape[1]
+        out_features = base_layer.weight.shape[0]
+
+        # LoRA A and B
+        self.lora_A = nn.Parameter(torch.zeros((r, in_features)))
+        self.lora_B = nn.Parameter(torch.zeros((out_features, r)))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        # original forward pass
+        result = self.base(x)
+        debug_norm = torch.norm(self.lora_B @ self.lora_A).item()
+        print("LoRA matrix norm:", debug_norm)
+        # LoRA path
+        lora_out = F.linear(self.dropout(x), (self.lora_B @ self.lora_A).to(x.dtype))
+        return result + self.scaling * lora_out
 
 class Attention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
@@ -107,8 +135,11 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
-        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
-        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+        self.qkv_proj = LoRACastedLinear(CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False), r=8, alpha=16)
+        self.o_proj = LoRACastedLinear(CastedLinear(self.output_size, self.hidden_size, bias=False), r=8, alpha=16)
+        # self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
+        # self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+        
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -131,14 +162,14 @@ class Attention(nn.Module):
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # Changed from view to reshape for PyTorch 2.8.0 compatibility
         return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):
         super().__init__()
 
-        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.linear = LoRACastedLinear(CastedLinear(hidden_size, hidden_size, bias=False), r=8, alpha=16)
         self.reverse = reverse
 
     def forward(self, x):
@@ -153,8 +184,8 @@ class SwiGLU(nn.Module):
         super().__init__()
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        self.gate_up_proj = LoRACastedLinear(CastedLinear(hidden_size, inter * 2, bias=False), r=8, alpha=16)
+        self.down_proj    = LoRACastedLinear(CastedLinear(inter, hidden_size, bias=False), r=8, alpha=16)
 
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)

@@ -131,6 +131,19 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         model: nn.Module = model_cls(model_cfg)
         print(model)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+
+        for name, param in model.named_parameters():
+            if "lora_" not in name:
+                param.requires_grad = False
+
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                print(name, param.shape, param.requires_grad)
+
+        trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+        print("trainable:", trainable)
+        print("count:", len(trainable))
+
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
@@ -286,28 +299,6 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def read_losses(file_path: str) -> list[float]:
-    """
-    Reads all numeric loss values from a file.
-    The file may contain multiple numbers separated by newlines or whitespace.
-
-    Args:
-        file_path (str): Path to the file containing the loss values.
-
-    Returns:
-        list[float]: List of all loss values read from the file.
-    """
-    with open(file_path, "r") as f:
-        content = f.read().strip()
-
-    # Split on any whitespace and convert each token to float
-    values = [float(token) for token in content.split()]
-
-    return values
-
-
-    
-
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -322,8 +313,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, _, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
-    loss = read_loss("loss.txt")
+    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+
     ((1 / global_batch_size) * loss).backward()
 
     # Allreduce
