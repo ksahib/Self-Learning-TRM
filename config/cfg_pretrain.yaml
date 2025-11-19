@@ -36,6 +36,7 @@ puzzle_emb_lr: 1e-2
 
 seed: 0
 min_eval_interval: 0 # when to start the eval
+max_eval_batches: 10 # Limit number of evaluation batches (None = no limit, set to small number for quick testing)
 
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate

@@ -74,7 +74,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
 
     # If subsample_size is specified for the training set,
     # randomly sample the desired number of examples.
-    if set_name == "train" and config.subsample_size is not None:
+    if config.subsample_size is not None:
         total_samples = len(inputs)
         if config.subsample_size < total_samples:
             indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
