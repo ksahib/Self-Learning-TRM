@@ -87,11 +87,19 @@ class MetaTrainState:
 
 
 def create_dataloader(config: MetaTrainConfig, split: str, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
+    dataset_paths = (
+        config.data_paths_val if split == "val" and len(config.data_paths_val) > 0 else config.data_paths
+    )
+    dataset_cfg = PuzzleDatasetConfig(
         seed=config.seed,
-        dataset_paths=config.data_paths_val if split == "val" and len(config.data_paths_val) > 0 else config.data_paths,
-        **kwargs
-    ), split=split)
+        dataset_paths=dataset_paths,
+        global_batch_size=kwargs.get("global_batch_size", config.global_batch_size),
+        test_set_mode=(split != "train"),
+        epochs_per_iter=kwargs.get("epochs_per_iter", 1),
+        rank=kwargs.get("rank", 0),
+        num_replicas=kwargs.get("num_replicas", 1),
+    )
+    dataset = PuzzleDataset(dataset_cfg, split=split)
     dataloader = DataLoader(
         dataset,
         batch_size=None,
