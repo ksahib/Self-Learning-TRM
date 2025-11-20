@@ -8,7 +8,7 @@ from torch import nn
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, LoRACastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -127,8 +127,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.lm_head      = LoRACastedLinear(CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False), r=8, alpha=16)
+        self.q_head       = LoRACastedLinear(CastedLinear(self.config.hidden_size, 2, bias=True), r=8, alpha=16)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -155,9 +155,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
+        # Note: q_head is now LoRACastedLinear, so we initialize the base layer
         with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.base.weight.zero_()
+            if self.q_head.base.bias is not None:
+                self.q_head.base.bias.fill_(-5)  # type: ignore
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding

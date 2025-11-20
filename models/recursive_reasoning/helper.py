@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Callable
 
 import torch
 import numpy as np
@@ -406,4 +406,308 @@ def load_base_trm_checkpoint(
     
     print("Checkpoint loaded successfully!")
     return model
+
+
+def get_lora_parameters(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+    """
+    Extract only LoRA parameters (lora_A, lora_B) from model for optimizer.
+    
+    This is used to create an optimizer that only updates LoRA weights
+    during base TRM fine-tuning, keeping the base model weights frozen.
+    
+    Args:
+        model: PyTorch model (should contain LoRACastedLinear layers)
+    
+    Returns:
+        List of LoRA parameters (lora_A and lora_B from all LoRA layers)
+    """
+    lora_params = []
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            lora_params.append(param)
+    return lora_params
+
+
+def compute_base_trm_eval(
+    base_model: "TinyRecursiveReasoningModel_ACTV1",
+    batch: Dict[str, torch.Tensor],
+    loss_fn: Optional[Callable] = None,
+    loss_type: str = "softmax_cross_entropy",
+) -> Dict[str, float]:
+    """
+    Run a forward pass (with ACT) on the base TRM and compute evaluation metrics.
+    
+    Returns:
+        Dictionary with detached loss, token accuracy and sequence accuracy values.
+    """
+    from models.losses import IGNORE_LABEL_ID, softmax_cross_entropy, stablemax_cross_entropy
+    
+    if loss_fn is None:
+        if loss_type == "stablemax_cross_entropy":
+            loss_fn = stablemax_cross_entropy
+        else:
+            loss_fn = softmax_cross_entropy
+    
+    base_model.eval()
+    
+    with torch.inference_mode():
+        carry = base_model.initial_carry(batch)
+        all_finish = False
+        while not all_finish:
+            carry, outputs = base_model(carry=carry, batch=batch)
+            all_finish = carry.halted.all().item()
+        
+        logits = outputs["logits"]
+        labels = batch["labels"]
+        
+        mask = (labels != IGNORE_LABEL_ID)
+        loss_counts = mask.sum(-1)
+        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+        valid_sequences = carry.halted & (loss_counts > 0)
+        valid_count = int(valid_sequences.sum().item())
+        normalizer = max(valid_count, 1)
+        
+        if loss_type == "stablemax_cross_entropy":
+            per_token_loss = loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
+        else:
+            per_token_loss = loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID)
+        
+        lm_loss_sum = (per_token_loss / loss_divisor).sum()
+        lm_loss_value = float((lm_loss_sum / normalizer).detach().cpu().item())
+        
+        preds = logits.argmax(dim=-1)
+        correct_tokens = (preds == labels) & mask
+        token_accuracy_sum = torch.where(
+            valid_sequences,
+            (correct_tokens.to(torch.float32) / loss_divisor).sum(-1),
+            torch.zeros_like(loss_counts, dtype=torch.float32),
+        ).sum()
+        token_accuracy = float((token_accuracy_sum / normalizer).detach().cpu().item())
+        
+        seq_is_correct = correct_tokens.sum(-1) == loss_counts
+        exact_accuracy_sum = (valid_sequences & seq_is_correct).sum()
+        exact_accuracy = float(exact_accuracy_sum.item() / normalizer)
+        
+        q_halt_accuracy = None
+        q_halt_loss_value = None
+        if "q_halt_logits" in outputs:
+            q_halt_logits = outputs["q_halt_logits"]
+            q_halt_pred_correct = (q_halt_logits >= 0) == seq_is_correct
+            q_halt_accuracy_sum = torch.where(
+                valid_sequences, q_halt_pred_correct.to(torch.float32), torch.zeros_like(loss_counts, dtype=torch.float32)
+            ).sum()
+            q_halt_accuracy = float(q_halt_accuracy_sum.item() / normalizer)
+            
+            q_halt_loss_sum = torch.nn.functional.binary_cross_entropy_with_logits(
+                q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum"
+            )
+            q_halt_loss_value = float(q_halt_loss_sum.detach().cpu().item() / normalizer)
+        
+        q_continue_loss_value = None
+        if "target_q_continue" in outputs and "q_continue_logits" in outputs:
+            q_continue_loss_sum = torch.nn.functional.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum"
+            )
+            q_continue_loss_value = float(q_continue_loss_sum.detach().cpu().item() / normalizer)
+        
+        steps_sum = torch.where(
+            valid_sequences, carry.steps.to(torch.float32), torch.zeros_like(loss_counts, dtype=torch.float32)
+        ).sum()
+        avg_steps = float(steps_sum.item() / normalizer)
+        
+    total_tokens = int(mask.sum().item())
+    total_sequences = int((loss_counts > 0).sum().item())
+    
+    return {
+        "loss": lm_loss_value,
+        "lm_loss": lm_loss_value,
+        "token_accuracy": token_accuracy,
+        "accuracy": token_accuracy,
+        "sequence_accuracy": exact_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "q_halt_accuracy": q_halt_accuracy,
+        "q_halt_loss": q_halt_loss_value,
+        "q_continue_loss": q_continue_loss_value,
+        "steps": avg_steps,
+        "count": valid_count,
+        "total_tokens": total_tokens,
+        "total_sequences": total_sequences,
+    }
+
+
+def compute_base_trm_loss(
+    base_model: "TinyRecursiveReasoningModel_ACTV1",
+    batch: Dict[str, torch.Tensor],
+    loss_fn: Optional[Callable] = None,
+    loss_type: str = "softmax_cross_entropy",
+) -> torch.Tensor:
+    """
+    Backwards-compatible wrapper that returns only the detached loss tensor.
+    """
+    metrics = compute_base_trm_eval(
+        base_model=base_model,
+        batch=batch,
+        loss_fn=loss_fn,
+        loss_type=loss_type,
+    )
+    return torch.tensor(metrics["loss"])
+
+
+def compute_reward(
+    validation_loss: torch.Tensor,
+    reward_scale: float = 1.0,
+) -> float:
+    """
+    Compute reward from base TRM validation loss.
+    
+    Lower loss = higher reward (inverted relationship).
+    This is used for REINFORCE policy gradient updates.
+    
+    Args:
+        validation_loss: Detached validation loss tensor (scalar, no gradients)
+        reward_scale: Scaling factor for reward (default 1.0)
+    
+    Returns:
+        Reward value as Python float (not tensor)
+    
+    Example:
+        If validation_loss = 0.5 and reward_scale = 1.0:
+        reward = -0.5 * 1.0 = -0.5
+        
+        If validation_loss = 0.1 (better):
+        reward = -0.1 * 1.0 = -0.1 (higher reward, less negative)
+    """
+    # Ensure loss is detached and on CPU
+    if isinstance(validation_loss, torch.Tensor):
+        loss_value = validation_loss.detach().cpu().item()
+    else:
+        loss_value = float(validation_loss)
+    
+    # Reward = -loss * scale
+    # Lower loss → higher (less negative) reward
+    reward = -loss_value * reward_scale
+    
+    return reward
+
+
+def compute_rewards_from_augmentations(
+    base_model: "TinyRecursiveReasoningModel_ACTV1",
+    original_batch: Dict[str, torch.Tensor],
+    patterns: List[str],
+    num_finetune_steps: int,
+    baseline_loss: Optional[float] = None,
+    use_binary_reward: bool = True,
+    reward_scale: float = 1.0,
+    loss_type: str = "softmax_cross_entropy",
+    grid_height: int = 9,
+    grid_width: int = 9,
+) -> Tuple[
+    List[float],
+    float,
+    Dict[str, float],
+    List[Dict[str, float]],
+]:
+    """
+    Complete flow matching requ.txt: Fine-tune on augmented data → Evaluate on original input.
+    
+    For each augmentation pattern:
+    1. Apply augmentation to original batch
+    2. Fine-tune base TRM with LoRA on augmented batch
+    3. Evaluate fine-tuned model on ORIGINAL (non-augmented) batch
+    4. Compute binary reward: 1 if loss improved, 0 if not
+    
+    Args:
+        base_model: Base TRM model (will be fine-tuned in-place, then restored)
+        original_batch: Original batch with 'inputs', 'labels', etc. (used for evaluation)
+        patterns: List of augmentation patterns (e.g., ['LR.V.T', '.RH.OT', 'LRH.VT'])
+        num_finetune_steps: Number of LoRA fine-tuning steps per augmentation
+        baseline_loss: Validation loss before any fine-tuning (if None, will compute)
+        use_binary_reward: If True, binary reward (1 if improved, 0 if not)
+                         If False, continuous reward = -loss * scale
+        reward_scale: Scaling for continuous rewards
+        loss_type: Type of loss function ('softmax_cross_entropy' or 'stablemax_cross_entropy')
+        grid_height: Height of grid (default 9 for Sudoku)
+        grid_width: Width of grid (default 9 for Sudoku)
+    
+    Returns:
+        rewards: List of reward values (one per pattern), e.g., [0.0, 1.0, 0.0]
+        baseline_loss: The baseline loss value used for comparison
+        baseline_metrics: Dict with loss/accuracy stats before fine-tuning
+        pattern_eval_metrics: List of dicts with loss/accuracy per pattern
+    """
+    import copy
+    
+    # 1. Compute baseline metrics (on original batch, before fine-tuning)
+    base_model.eval()
+    baseline_metrics = compute_base_trm_eval(
+        base_model=base_model,
+        batch=original_batch,
+        loss_type=loss_type
+    )
+    if baseline_loss is None:
+        baseline_loss = baseline_metrics["loss"]
+    pattern_eval_metrics: List[Dict[str, float]] = []
+    # 2. Save original model state (to restore after each fine-tuning)
+    original_state = copy.deepcopy(base_model.state_dict())
+    
+    rewards = []
+    
+    # 3. For each augmentation pattern:
+    for pattern in patterns:
+        # 3a. Restore base model to original state
+        base_model.load_state_dict(original_state)
+        
+        # 3b. Apply augmentation to batch (for fine-tuning)
+        aug_batch = apply_augmentation_patterns_to_batch(
+            original_batch, [pattern], grid_height=grid_height, grid_width=grid_width
+        )
+        
+        # 3c. Fine-tune base TRM with LoRA on augmented data
+        base_model.train()
+        lora_params = get_lora_parameters(base_model)
+        if len(lora_params) == 0:
+            raise ValueError("No LoRA parameters found in model. Make sure model uses LoRACastedLinear layers.")
+        
+        optimizer = torch.optim.Adam(lora_params, lr=1e-4)
+        
+        for _ in range(num_finetune_steps):
+            carry = base_model.initial_carry(aug_batch)
+            carry, outputs = base_model(carry=carry, batch=aug_batch)
+            
+            if "labels" in aug_batch:
+                logits = outputs["logits"]
+                labels = aug_batch["labels"]
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.shape[-1]),
+                    labels.view(-1),
+                    ignore_index=-100
+                )
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+        
+        # 3d. Evaluate on ORIGINAL batch (not augmented!)
+        base_model.eval()
+        eval_metrics = compute_base_trm_eval(
+            base_model=base_model,
+            batch=original_batch,  # Original batch, not augmented
+            loss_type=loss_type
+        )
+        val_loss = eval_metrics["loss"]
+        pattern_eval_metrics.append(eval_metrics)
+        
+        # 3e. Compute reward
+        if use_binary_reward:
+            # Binary: 1 if improved, 0 if not
+            reward = 1.0 if val_loss < baseline_loss else 0.0
+        else:
+            # Continuous: -loss * scale (lower loss = higher reward)
+            reward = compute_reward(torch.tensor(val_loss), reward_scale=reward_scale)
+        
+        rewards.append(reward)
+    
+    # 4. Restore original model state
+    base_model.load_state_dict(original_state)
+    
+    return rewards, baseline_loss, baseline_metrics, pattern_eval_metrics
 

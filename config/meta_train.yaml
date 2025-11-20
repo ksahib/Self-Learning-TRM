@@ -1,0 +1,85 @@
+# Meta Training Config for REINFORCE
+
+# Meta model architecture
+meta_arch:
+  name: recursive_reasoning.metaTRM@MetaTRM
+  H_cycles: 2
+  L_cycles: 2
+  L_layers: 2
+  hidden_size: 64
+  num_heads: 2
+  expansion: 4
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  mlp_t: False
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 16
+  aug_slots: 6  # 3x2 grid
+  choices_per_slot: 2
+
+# Base model architecture (will be loaded from checkpoint)
+base_arch:
+  H_cycles: 3
+  L_cycles: 6
+  H_layers: 0
+  L_layers: 2
+  hidden_size: 512
+  num_heads: 8
+  expansion: 4
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  mlp_t: False
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+  halt_exploration_prob: 0.1
+  halt_max_steps: 16
+  no_ACT_continue: True
+
+# Base model checkpoint path
+base_checkpoint_path: "step_21700"  # Path to pretrained base TRM checkpoint
+
+# Data paths
+data_paths: ['data/arc-aug-1000']  # Training data
+data_paths_val: []  # Validation data (empty = use training data)
+
+# Hyperparameters
+global_batch_size: 32
+meta_epochs: 100
+
+# Meta model optimizer
+meta_lr: 1e-4
+meta_weight_decay: 0.01
+meta_beta1: 0.9
+meta_beta2: 0.95
+
+# Base fine-tuning
+num_finetune_steps: 10  # Number of LoRA fine-tuning steps per augmentation
+base_finetune_lr: 1e-4
+
+# Reward config
+reward_scale: 1.0
+use_binary_reward: True  # True = binary (1 if improved, 0 if not), False = continuous
+
+# REINFORCE config
+baseline_momentum: 0.9  # Moving average for reward baseline
+entropy_coefficient: 0.01  # Entropy regularization coefficient
+
+# Number of augmentation patterns to sample per batch (hyperparameter)
+# This determines how many different augmentation strategies to try per batch
+# Higher values = more exploration but slower training
+# Lower values = faster training but less exploration
+num_patterns_per_batch: 3
+
+# Names
+project_name: "MetaTRM-REINFORCE"
+run_name: null  # Will be auto-generated if null
+load_checkpoint: null  # Path to meta model checkpoint to resume from
+checkpoint_path: null  # Will be auto-generated if null
+
+# Extras
+seed: 0
+checkpoint_interval: 100  # Save checkpoint every N steps
+eval_interval: 10  # Print eval info every N steps
+device: "cuda"
+loss_type: "softmax_cross_entropy"  # or "stablemax_cross_entropy"
+
