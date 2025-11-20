@@ -138,7 +138,57 @@ def create_meta_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMeta
 
 def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata):
     """Load pretrained base TRM model."""
-    base_arch_cfg = dict(config.base_arch)
+    import os
+    import yaml
+    
+    # Try to load config from checkpoint directory if it exists
+    # First, find where the checkpoint file actually is
+    checkpoint_path = config.base_checkpoint_path
+    actual_checkpoint_file = None
+    
+    # Try to locate the checkpoint file
+    if os.path.exists(checkpoint_path):
+        actual_checkpoint_file = checkpoint_path
+    elif os.path.exists(os.path.join("checkpoints", checkpoint_path)):
+        actual_checkpoint_file = os.path.join("checkpoints", checkpoint_path)
+    else:
+        # Search in checkpoints subdirectories
+        if os.path.exists("checkpoints"):
+            for root, dirs, files in os.walk("checkpoints"):
+                if checkpoint_path in files or os.path.basename(checkpoint_path) in files:
+                    actual_checkpoint_file = os.path.join(root, checkpoint_path if checkpoint_path in files else os.path.basename(checkpoint_path))
+                    break
+    
+    # Find config in the same directory as checkpoint
+    checkpoint_config_path = None
+    if actual_checkpoint_file:
+        checkpoint_dir = os.path.dirname(actual_checkpoint_file)
+        config_path = os.path.join(checkpoint_dir, "all_config.yaml")
+        if os.path.exists(config_path):
+            checkpoint_config_path = config_path
+    
+    base_arch_cfg = dict(config.base_arch)  # Default to config.base_arch
+    
+    if os.path.exists(checkpoint_config_path):
+        print(f"Loading checkpoint config from {checkpoint_config_path}")
+        try:
+            with open(checkpoint_config_path, "rt") as f:
+                checkpoint_config = yaml.safe_load(f)
+            
+            # Extract arch config from checkpoint
+            if "arch" in checkpoint_config:
+                checkpoint_arch = checkpoint_config["arch"]
+                # Use checkpoint's arch config, but allow overrides from meta_train.yaml
+                print(f"Found checkpoint config with arch: {checkpoint_arch.get('name', 'unknown')}")
+                # Merge: checkpoint config as base, but allow meta_train.yaml to override
+                base_arch_cfg = {**checkpoint_arch, **config.base_arch}
+                print(f"Using merged arch config: {base_arch_cfg}")
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint config ({e}), using meta_train.yaml base_arch")
+    else:
+        print(f"Checkpoint config not found at {checkpoint_config_path}, using meta_train.yaml base_arch")
+    
+    # Remove reserved keys that will be set from metadata
     for reserved_key in ("batch_size", "vocab_size", "seq_len", "num_puzzle_identifiers", "causal"):
         base_arch_cfg.pop(reserved_key, None)
     
@@ -360,11 +410,18 @@ def train_meta_batch(
         "meta/mean_reward": mean_reward,
         "meta/baseline_reward": train_state.baseline_reward,
         "meta/baseline_loss": baseline_loss,
-        "meta/rewards": rewards,  # List of rewards
         "meta/step": train_state.step,
-        **trm_baseline_metrics,
-        **trm_post_metrics,
     }
+    
+    # Add TRM baseline metrics (filter out None values - W&B ignores them)
+    for key, value in trm_baseline_metrics.items():
+        if value is not None:
+            metrics[key] = value
+    
+    # Add TRM post metrics (filter out None values - W&B ignores them)
+    for key, value in trm_post_metrics.items():
+        if value is not None:
+            metrics[key] = value
     
     return metrics
 
@@ -452,6 +509,8 @@ def launch(hydra_config: DictConfig):
         
         train_state.meta_model.train()
         
+        epoch_metrics = None
+        
         for batch_idx, (set_name, train_batch, global_batch_size) in enumerate(train_loader):
             # Get validation batch (cycle through validation set)
             try:
@@ -469,10 +528,15 @@ def launch(hydra_config: DictConfig):
                 val_batch=val_batch,
             )
             
-            # Log metrics
-            if train_state.step % 10 == 0:
+            # Keep track of last metrics for epoch-end logging
+            epoch_metrics = metrics
+            
+            # Log metrics (log every step, or at eval_interval)
+            if train_state.step % config.eval_interval == 0 or train_state.step == 1:
                 wandb.log(metrics, step=train_state.step)
-                progress_bar.update(10)
+            
+            # Update progress bar every step
+            progress_bar.update(1)
             
             # Checkpoint
             if train_state.step % config.checkpoint_interval == 0:
@@ -481,6 +545,14 @@ def launch(hydra_config: DictConfig):
             # Evaluation
             if train_state.step % config.eval_interval == 0 and train_state.step > 0:
                 print(f"\nStep {train_state.step}: Mean reward = {metrics['meta/mean_reward']:.4f}, Baseline = {metrics['meta/baseline_reward']:.4f}")
+                if 'trm_eval/baseline/accuracy' in metrics and metrics['trm_eval/baseline/accuracy'] is not None:
+                    print(f"  TRM Baseline Accuracy: {metrics['trm_eval/baseline/accuracy']:.4f}")
+                if 'trm_eval/post/accuracy_mean' in metrics and metrics['trm_eval/post/accuracy_mean'] is not None:
+                    print(f"  TRM Post-Aug Accuracy: {metrics['trm_eval/post/accuracy_mean']:.4f}")
+        
+        # Log metrics at end of epoch (if we have any)
+        if epoch_metrics is not None:
+            wandb.log(epoch_metrics, step=train_state.step)
         
         # Epoch checkpoint
         save_checkpoint(config, train_state)
