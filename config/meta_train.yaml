@@ -12,7 +12,7 @@ meta_arch:
   pos_encodings: rope
   forward_dtype: bfloat16
   mlp_t: False
-  puzzle_emb_ndim: 0
+  puzzle_emb_ndim: 64  # or 512
   puzzle_emb_len: 16
   aug_slots: 6  # 3x2 grid
   choices_per_slot: 2

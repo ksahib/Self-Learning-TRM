@@ -211,18 +211,21 @@ class MetaTRMInner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = next(self.parameters()).device
         return MetaTRMInnerCarry(
             z_H=torch.empty(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
+                device=device,
             ),
             z_L=torch.empty(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
+                device=device,
             ),
         )
 
@@ -253,8 +256,11 @@ class MetaTRMInner(nn.Module):
 
         new_carry = MetaTRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
 
-        key_value = z_H[:, self.puzzle_emb_len :]
-        aug_queries = self.aug_queries.unsqueeze(0).expand(key_value.shape[0], -1, -1)
+        attn_dtype = self.aug_pool.in_proj_weight.dtype
+        key_value = z_H[:, self.puzzle_emb_len :].to(attn_dtype)
+        aug_queries = (
+            self.aug_queries.unsqueeze(0).expand(key_value.shape[0], -1, -1).to(attn_dtype)
+        )
         aug_repr, _ = self.aug_pool(query=aug_queries, key=key_value, value=key_value)
         aug_logits = self.aug_head(aug_repr)
         return new_carry, aug_logits

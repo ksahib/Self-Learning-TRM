@@ -138,13 +138,12 @@ def create_meta_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMeta
 
 def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata):
     """Load pretrained base TRM model."""
-    # Infer vocab_size from checkpoint if not in config
-    if "vocab_size" not in config.base_arch:
-        vocab_size = infer_vocab_size_from_checkpoint(config.base_checkpoint_path)
-        config.base_arch["vocab_size"] = vocab_size
+    base_arch_cfg = dict(config.base_arch)
+    for reserved_key in ("batch_size", "vocab_size", "seq_len", "num_puzzle_identifiers", "causal"):
+        base_arch_cfg.pop(reserved_key, None)
     
     model_cfg = dict(
-        **config.base_arch,
+        **base_arch_cfg,
         batch_size=config.global_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
@@ -162,6 +161,10 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
         map_location=config.device,
         strict=False,
     )
+    
+    # Explicitly move model to device to ensure all buffers are moved
+    device_obj = torch.device(config.device)
+    base_model = base_model.to(device_obj)
     
     # Freeze base weights, only LoRA will be trainable
     for name, param in base_model.named_parameters():

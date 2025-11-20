@@ -676,10 +676,10 @@ def compute_rewards_from_augmentations(
             
             if "labels" in aug_batch:
                 logits = outputs["logits"]
-                labels = aug_batch["labels"]
+                labels = aug_batch["labels"].long()  # Convert to int64 for CUDA cross_entropy
                 loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.shape[-1]),
-                    labels.view(-1),
+                    logits.reshape(-1, logits.shape[-1]),
+                    labels.reshape(-1),
                     ignore_index=-100
                 )
                 loss.backward()

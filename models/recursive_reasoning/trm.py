@@ -184,15 +184,73 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = next(self.parameters()).device
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(
+                batch_size,
+                self.config.seq_len + self.puzzle_emb_len,
+                self.config.hidden_size,
+                dtype=self.forward_dtype,
+                device=device,
+            ),
+            z_L=torch.empty(
+                batch_size,
+                self.config.seq_len + self.puzzle_emb_len,
+                self.config.hidden_size,
+                dtype=self.forward_dtype,
+                device=device,
+            ),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
+        device = carry.z_H.device
+        batch_size = carry.z_H.shape[0]
+        seq_len = carry.z_H.shape[1]
+        
+        # Ensure reset_flag is on the same device as carry
+        if reset_flag.device != device:
+            reset_flag = reset_flag.to(device=device)
+        
+        # Get buffer values - ensure they're on the correct device
+        # nn.Buffer might not move with model.to(), so we explicitly create tensors on device
+        H_init_raw = self.H_init
+        L_init_raw = self.L_init
+        
+        # Convert to tensor on device (handles both tensor and non-tensor inputs)
+        # Use detach().cpu() to ensure we get the value, then create new tensor on device
+        if isinstance(H_init_raw, torch.Tensor):
+            H_init_val = H_init_raw.detach().cpu().to(device=device, dtype=self.forward_dtype)
+        else:
+            # Try to get underlying tensor if it's a Buffer wrapper
+            if hasattr(H_init_raw, 'data'):
+                H_init_data = H_init_raw.data
+                if isinstance(H_init_data, torch.Tensor):
+                    H_init_val = H_init_data.detach().cpu().to(device=device, dtype=self.forward_dtype)
+                else:
+                    H_init_val = torch.tensor(H_init_data, device=device, dtype=self.forward_dtype)
+            else:
+                H_init_val = torch.tensor(H_init_raw, device=device, dtype=self.forward_dtype)
+        
+        if isinstance(L_init_raw, torch.Tensor):
+            L_init_val = L_init_raw.detach().cpu().to(device=device, dtype=self.forward_dtype)
+        else:
+            # Try to get underlying tensor if it's a Buffer wrapper
+            if hasattr(L_init_raw, 'data'):
+                L_init_data = L_init_raw.data
+                if isinstance(L_init_data, torch.Tensor):
+                    L_init_val = L_init_data.detach().cpu().to(device=device, dtype=self.forward_dtype)
+                else:
+                    L_init_val = torch.tensor(L_init_data, device=device, dtype=self.forward_dtype)
+            else:
+                L_init_val = torch.tensor(L_init_raw, device=device, dtype=self.forward_dtype)
+        
+        # Expand to match carry shape: [batch_size, seq_len, hidden_size]
+        H_init = H_init_val.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        L_init = L_init_val.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_H=torch.where(reset_flag.view(-1, 1, 1), H_init, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), L_init, carry.z_L),
         )
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -238,12 +296,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
