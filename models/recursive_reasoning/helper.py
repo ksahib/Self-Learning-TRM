@@ -317,13 +317,14 @@ def load_base_trm_checkpoint(
     """
     Load pretrained checkpoint into base TRM model.
     
+    Matches the behavior of pretrain.py's load_checkpoint function.
     Handles:
     - torch.compile prefixes (_orig_mod.)
-    - Missing/extra keys (if strict=False)
     - Puzzle embedding shape mismatches
+    - Old checkpoint format (non-LoRA) -> LoRA conversion
     
     Args:
-        checkpoint_path: Path to checkpoint file (e.g., "tryinghugs/step_21700")
+        checkpoint_path: Path to checkpoint file (e.g., "step_21700")
         model: Base TRM model instance to load weights into
         map_location: Device to load checkpoint on ("cpu", "cuda", etc.)
         strict: If True, requires exact key match; if False, allows missing/extra keys
@@ -332,79 +333,83 @@ def load_base_trm_checkpoint(
         Model with loaded weights (same instance, modified in-place)
     """
     import torch
+    import os
     
     print(f"Loading checkpoint from {checkpoint_path}")
     
-    # Load state dict
+    # Check if checkpoint file exists (try multiple locations like pretrain.py would)
+    if not os.path.exists(checkpoint_path):
+        alt_paths = [
+            os.path.join("checkpoints", checkpoint_path),
+            os.path.join(".", checkpoint_path),
+        ]
+        found = False
+        for alt_path in alt_paths:
+            if os.path.exists(alt_path):
+                checkpoint_path = alt_path
+                found = True
+                break
+        
+        if not found:
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    # Load state dict (same as pretrain.py line 265)
     state_dict = torch.load(checkpoint_path, map_location=map_location)
     
-    # Handle torch.compile prefixes (_orig_mod.)
-    # Check if state dict has _orig_mod prefix but model doesn't
-    has_orig_mod = any(k.startswith("_orig_mod.") for k in state_dict.keys())
-    
-    if has_orig_mod:
-        # Remove _orig_mod prefix from keys
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith("_orig_mod."):
-                new_key = key[len("_orig_mod."):]
-                # Also remove "model." prefix if present (from ACTLossHead wrapper)
-                if new_key.startswith("model."):
-                    new_key = new_key[len("model."):]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
-        state_dict = new_state_dict
-    
-    # Handle puzzle embedding shape mismatches (similar to pretrain.py)
-    puzzle_emb_keys = [
-        "inner.puzzle_emb.weights",
-        "puzzle_emb.weights",
-    ]
-    
-    for puzzle_emb_key in puzzle_emb_keys:
-        if puzzle_emb_key in state_dict:
-            if hasattr(model, "inner") and hasattr(model.inner, "puzzle_emb"):
-                expected_shape = model.inner.puzzle_emb.weights.shape
-                loaded_shape = state_dict[puzzle_emb_key].shape
-                
-                if loaded_shape != expected_shape:
-                    print(
-                        f"Puzzle embedding shape mismatch for {puzzle_emb_key}. "
-                        f"Found {loaded_shape}, Expected {expected_shape}. "
-                        f"Re-initializing using mean."
-                    )
-                    # Re-initialize using mean (similar to pretrain.py)
-                    state_dict[puzzle_emb_key] = (
-                        torch.mean(state_dict[puzzle_emb_key], dim=0, keepdim=True)
-                        .expand(expected_shape)
-                        .contiguous()
-                    )
-    
-    # Load state dict
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
-    
-    if missing_keys:
-        print(f"Warning: Missing keys in checkpoint: {len(missing_keys)} keys")
-        if len(missing_keys) <= 10:
-            for key in missing_keys:
-                print(f"  - {key}")
+    # Handle torch.compile prefixes (_orig_mod.) - same as pretrain.py expects
+    # Remove _orig_mod.model. prefix if present (from torch.compile + ACTLossHead wrapper)
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("_orig_mod.model."):
+            new_key = key[len("_orig_mod.model."):]
+            new_state_dict[new_key] = value
+        elif key.startswith("_orig_mod."):
+            new_key = key[len("_orig_mod."):]
+            new_state_dict[new_key] = value
         else:
-            for key in missing_keys[:10]:
-                print(f"  - {key}")
-            print(f"  ... and {len(missing_keys) - 10} more")
+            new_state_dict[key] = value
+    state_dict = new_state_dict
     
-    if unexpected_keys:
-        print(f"Warning: Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
-        if len(unexpected_keys) <= 10:
-            for key in unexpected_keys:
-                print(f"  - {key}")
-        else:
-            for key in unexpected_keys[:10]:
-                print(f"  - {key}")
-            print(f"  ... and {len(unexpected_keys) - 10} more")
+    # Handle old checkpoint format (without LoRA) -> convert to LoRA format
+    # Old checkpoints have: inner.lm_head.weight
+    # New model expects: inner.lm_head.base.weight
+    old_to_new_mappings = {
+        "inner.lm_head.weight": "inner.lm_head.base.weight",
+        "inner.q_head.weight": "inner.q_head.base.weight",
+        "inner.q_head.bias": "inner.q_head.base.bias",
+    }
     
-    print("Checkpoint loaded successfully!")
+    # Also handle attention and MLP layers
+    for layer_idx in range(10):  # Check up to 10 layers
+        old_to_new_mappings.update({
+            f"inner.L_level.layers.{layer_idx}.self_attn.qkv_proj.weight": f"inner.L_level.layers.{layer_idx}.self_attn.qkv_proj.base.weight",
+            f"inner.L_level.layers.{layer_idx}.self_attn.o_proj.weight": f"inner.L_level.layers.{layer_idx}.self_attn.o_proj.base.weight",
+            f"inner.L_level.layers.{layer_idx}.mlp.gate_up_proj.weight": f"inner.L_level.layers.{layer_idx}.mlp.gate_up_proj.base.weight",
+            f"inner.L_level.layers.{layer_idx}.mlp.down_proj.weight": f"inner.L_level.layers.{layer_idx}.mlp.down_proj.base.weight",
+        })
+    
+    # Convert old keys to new keys
+    for old_key, new_key in old_to_new_mappings.items():
+        if old_key in state_dict and new_key not in state_dict:
+            state_dict[new_key] = state_dict.pop(old_key)
+    
+    # Handle puzzle embedding shape mismatches (same as pretrain.py lines 267-277)
+    puzzle_emb_name = "inner.puzzle_emb.weights"
+    if puzzle_emb_name in state_dict:
+        if hasattr(model, "inner") and hasattr(model.inner, "puzzle_emb"):
+            expected_shape = model.inner.puzzle_emb.weights.shape
+            puzzle_emb = state_dict[puzzle_emb_name]
+            if puzzle_emb.shape != expected_shape:
+                print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
+                # Re-initialize using mean (same as pretrain.py)
+                state_dict[puzzle_emb_name] = (
+                    torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
+                )
+    
+    # Load state dict (same as pretrain.py line 278: uses assign=True)
+    # Use strict=False to allow missing LoRA keys (old checkpoints don't have LoRA)
+    model.load_state_dict(state_dict, strict=False, assign=True)
+    
     return model
 
 
@@ -453,9 +458,17 @@ def compute_base_trm_eval(
     with torch.inference_mode():
         carry = base_model.initial_carry(batch)
         all_finish = False
-        while not all_finish:
+        max_iterations = 100  # Safety limit
+        iteration = 0
+        while not all_finish and iteration < max_iterations:
             carry, outputs = base_model(carry=carry, batch=batch)
             all_finish = carry.halted.all().item()
+            iteration += 1
+        
+        if iteration >= max_iterations:
+            print(f"WARNING: Evaluation loop reached max_iterations ({max_iterations})")
+            print(f"  carry.halted: {carry.halted}")
+            print(f"  carry.steps: {carry.steps}")
         
         logits = outputs["logits"]
         labels = batch["labels"]
@@ -466,6 +479,19 @@ def compute_base_trm_eval(
         valid_sequences = carry.halted & (loss_counts > 0)
         valid_count = int(valid_sequences.sum().item())
         normalizer = max(valid_count, 1)
+        
+        # Debug prints when there's an issue (valid_count == 0 means exact_accuracy will be 0)
+        if valid_count == 0:
+            print(f"\n⚠ DEBUG compute_base_trm_eval - valid_count is 0 (exact_accuracy will be 0):")
+            print(f"  carry.halted: {carry.halted.tolist()}")
+            print(f"  carry.steps: {carry.steps.tolist()}")
+            print(f"  loss_counts: {loss_counts.tolist()}")
+            print(f"  valid_sequences: {valid_sequences.tolist()}")
+            print(f"  labels shape: {labels.shape}")
+            print(f"  labels unique values: {torch.unique(labels).tolist()}")
+            print(f"  mask sum (non-ignored labels): {mask.sum().item()}")
+            print(f"  IGNORE_LABEL_ID: {IGNORE_LABEL_ID}")
+            print(f"  Iterations to halt: {iteration}")
         
         if loss_type == "stablemax_cross_entropy":
             per_token_loss = loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
@@ -487,6 +513,16 @@ def compute_base_trm_eval(
         seq_is_correct = correct_tokens.sum(-1) == loss_counts
         exact_accuracy_sum = (valid_sequences & seq_is_correct).sum()
         exact_accuracy = float(exact_accuracy_sum.item() / normalizer)
+        
+        # Additional debug info when exact_accuracy is 0 but we have valid sequences
+        if exact_accuracy == 0.0 and valid_count > 0:
+            print(f"\n⚠ DEBUG: exact_accuracy=0.0 but valid_count={valid_count}")
+            print(f"  token_accuracy: {token_accuracy:.4f}")
+            print(f"  correct_tokens per sequence: {correct_tokens.sum(-1).tolist()}")
+            print(f"  loss_counts per sequence: {loss_counts.tolist()}")
+            print(f"  seq_is_correct: {seq_is_correct.tolist()}")
+            print(f"  valid_sequences: {valid_sequences.tolist()}")
+            print(f"  This means: {valid_count} sequences are valid, but none have ALL tokens correct")
         
         q_halt_accuracy = None
         q_halt_loss_value = None
