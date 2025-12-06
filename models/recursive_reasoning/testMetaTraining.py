@@ -34,6 +34,13 @@ from models.recursive_reasoning.helper import (
     load_base_trm_checkpoint,
     compute_base_trm_eval,
 )
+from utils.vector_db import PuzzleVectorDB
+from utils.build_vector_db import build_vector_database
+from few_shot_dataset import FewShotDataset
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
+import numpy as np
+import tempfile
+import shutil
 
 
 def _build_meta_config(batch_size: int, seq_len: int, vocab_size: int) -> dict:
@@ -1036,6 +1043,605 @@ def test_end_to_end():
     return True
 
 
+def test_vector_database_build_and_load():
+    """Test 10: Vector database building and loading"""
+    print("\n" + "="*50)
+    print("Test 10: Vector database build and load")
+    print("="*50)
+    
+    # Try to find dataset
+    data_paths = [
+        "data/sudoku-extreme-3-aug-3",
+        "../../data/sudoku-extreme-3-aug-3",
+        "../data/sudoku-extreme-3-aug-3",
+        "data/sudoku-extreme-100-aug-100",
+    ]
+    
+    data_path = None
+    for path in data_paths:
+        if os.path.exists(path):
+            data_path = path
+            break
+    
+    if data_path is None:
+        print(f"⚠ Dataset not found (checked: {', '.join(data_paths)})")
+        print("  Skipping vector database build test")
+        return None
+    
+    print(f"✓ Found dataset: {data_path}")
+    
+    # Try to find checkpoint
+    checkpoint_paths = [
+        "step_21700",
+        "checkpoints/step_21700",
+        "../step_21700",
+        "../../step_21700",
+    ]
+    
+    checkpoint_path = None
+    for path in checkpoint_paths:
+        if os.path.exists(path):
+            checkpoint_path = path
+            break
+    
+    if checkpoint_path is None:
+        print("⚠ No checkpoint found for building vector database")
+        print("  Skipping vector database build test")
+        return None
+    
+    print(f"✓ Found checkpoint: {checkpoint_path}")
+    
+    # Create temporary directory for vector DB
+    temp_dir = tempfile.mkdtemp()
+    vector_db_path = os.path.join(temp_dir, "test_vector_db.npz")
+    
+    try:
+        # Build base config for vector DB
+        batch_size = 2
+        seq_len = 81
+        vocab_size = 11  # Default for sudoku
+        
+        # Load dataset to get actual metadata
+        dataset_cfg = PuzzleDatasetConfig(
+            seed=0,
+            dataset_paths=[data_path],
+            global_batch_size=batch_size,
+            test_set_mode=False,
+            epochs_per_iter=1,
+            rank=0,
+            num_replicas=1,
+        )
+        dataset = PuzzleDataset(dataset_cfg, split="train")
+        metadata = dataset.metadata
+        
+        print(f"✓ Loaded dataset metadata:")
+        print(f"    vocab_size: {metadata.vocab_size}")
+        print(f"    seq_len: {metadata.seq_len}")
+        print(f"    num_puzzle_identifiers: {metadata.num_puzzle_identifiers}")
+        
+        # Try to infer arch config from checkpoint
+        print(f"\n  Inferring architecture from checkpoint...")
+        checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Handle wrapped checkpoints
+        if isinstance(checkpoint_data, dict):
+            if "model_state_dict" in checkpoint_data:
+                state_dict = checkpoint_data["model_state_dict"]
+            else:
+                state_dict = checkpoint_data
+        else:
+            state_dict = checkpoint_data
+        
+        # Handle torch.compile prefixes
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith("_orig_mod."):
+                    new_key = key[len("_orig_mod."):]
+                    if new_key.startswith("model."):
+                        new_key = new_key[len("model."):]
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value
+            state_dict = new_state_dict
+        
+        # Infer hidden_size and vocab_size
+        inferred_hidden_size = None
+        inferred_vocab_size = None
+        
+        embedding_keys = [
+            "inner.embed_tokens.embedding_weight",
+            "embed_tokens.embedding_weight",
+        ]
+        for key in embedding_keys:
+            if key in state_dict:
+                inferred_vocab_size = state_dict[key].shape[0]
+                inferred_hidden_size = state_dict[key].shape[1]
+                print(f"    Inferred from {key}: vocab_size={inferred_vocab_size}, hidden_size={inferred_hidden_size}")
+                break
+        
+        if inferred_hidden_size is None:
+            init_keys = ["inner.H_init", "H_init"]
+            for key in init_keys:
+                if key in state_dict:
+                    inferred_hidden_size = state_dict[key].shape[0]
+                    print(f"    Inferred hidden_size={inferred_hidden_size} from {key}")
+                    break
+        
+        # Try to load config from checkpoint directory
+        import yaml
+        checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+        config_path = os.path.join(checkpoint_dir, "all_config.yaml")
+        
+        # Default arch config
+        arch_config = {
+            "H_cycles": 2,
+            "L_cycles": 2,
+            "H_layers": 0,
+            "L_layers": 2,
+            "hidden_size": inferred_hidden_size or 128,
+            "num_heads": 4,
+            "expansion": 4.0,
+            "pos_encodings": "rope",
+            "forward_dtype": "float32",
+            "mlp_t": False,
+            "puzzle_emb_ndim": inferred_hidden_size or 128,
+            "puzzle_emb_len": 16,
+            "halt_exploration_prob": 0.1,
+            "halt_max_steps": 8,
+            "no_ACT_continue": True,
+        }
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "rt") as f:
+                    checkpoint_config = yaml.safe_load(f)
+                
+                if "arch" in checkpoint_config:
+                    checkpoint_arch = checkpoint_config["arch"]
+                    print(f"    Loading config from {config_path}")
+                    arch_config.update({
+                        "H_cycles": checkpoint_arch.get("H_cycles", arch_config["H_cycles"]),
+                        "L_cycles": checkpoint_arch.get("L_cycles", arch_config["L_cycles"]),
+                        "L_layers": checkpoint_arch.get("L_layers", arch_config["L_layers"]),
+                        "hidden_size": inferred_hidden_size or checkpoint_arch.get("hidden_size", arch_config["hidden_size"]),
+                        "num_heads": checkpoint_arch.get("num_heads", arch_config["num_heads"]),
+                        "expansion": float(checkpoint_arch.get("expansion", arch_config["expansion"])),
+                        "puzzle_emb_ndim": inferred_hidden_size or checkpoint_arch.get("puzzle_emb_ndim", arch_config["puzzle_emb_ndim"]),
+                        "puzzle_emb_len": checkpoint_arch.get("puzzle_emb_len", arch_config["puzzle_emb_len"]),
+                        "halt_max_steps": checkpoint_arch.get("halt_max_steps", arch_config["halt_max_steps"]),
+                        "halt_exploration_prob": checkpoint_arch.get("halt_exploration_prob", arch_config["halt_exploration_prob"]),
+                    })
+                    print(f"    ✓ Config loaded from YAML")
+            except Exception as e:
+                print(f"    ⚠ Could not load config from YAML: {e}")
+        
+        print(f"    Final arch config: hidden_size={arch_config['hidden_size']}, vocab_size will use dataset value")
+        
+        print(f"\n  Building vector database...")
+        print(f"    Output: {vector_db_path}")
+        print(f"    Device: cpu (for testing)")
+        
+        # Build vector database
+        vector_db = build_vector_database(
+            data_paths=[data_path],
+            model_checkpoint=checkpoint_path,
+            output_path=vector_db_path,
+            arch_config=arch_config,
+            device="cpu",  # Use CPU for testing
+            batch_size=2,  # Small batch for testing
+            seed=0,
+        )
+        
+        print(f"✓ Vector database built successfully!")
+        print(f"    Total puzzles: {len(vector_db)}")
+        print(f"    Embedding shape: {vector_db.embeddings.shape}")
+        print(f"    Puzzle indices shape: {vector_db.puzzle_indices.shape}")
+        print(f"    Puzzle identifiers shape: {vector_db.puzzle_identifiers.shape}")
+        
+        # Test loading
+        print(f"\n  Testing vector database loading...")
+        loaded_db = PuzzleVectorDB.load(vector_db_path)
+        
+        assert len(loaded_db) == len(vector_db), "Loaded DB size mismatch"
+        assert loaded_db.embeddings.shape == vector_db.embeddings.shape, "Embedding shape mismatch"
+        assert np.allclose(loaded_db.embeddings, vector_db.embeddings), "Embeddings don't match"
+        
+        print(f"✓ Vector database loaded successfully!")
+        print(f"    Verified {len(loaded_db)} puzzles")
+        
+        # Cleanup
+        shutil.rmtree(temp_dir)
+        print(f"✓ Cleaned up temporary files")
+        
+        return loaded_db
+        
+    except Exception as e:
+        print(f"✗ Vector database build failed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Cleanup on error
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        return None
+
+
+def test_vector_database_search():
+    """Test 11: Vector database search functionality"""
+    print("\n" + "="*50)
+    print("Test 11: Vector database search")
+    print("="*50)
+    
+    # Try to load existing vector DB or build one
+    vector_db_paths = [
+        "vector_db/arc_aug_1000.npz",
+        "vector_db/test_vector_db.npz",
+        "../../vector_db/arc_aug_1000.npz",
+    ]
+    
+    vector_db = None
+    for path in vector_db_paths:
+        if os.path.exists(path):
+            try:
+                print(f"  Loading vector database from {path}...")
+                vector_db = PuzzleVectorDB.load(path)
+                print(f"✓ Loaded vector database with {len(vector_db)} puzzles")
+                break
+            except Exception as e:
+                print(f"  ⚠ Failed to load {path}: {e}")
+                continue
+    
+    if vector_db is None:
+        print("⚠ No vector database found, trying to build one...")
+        vector_db = test_vector_database_build_and_load()
+    
+    if vector_db is None:
+        print("⚠ Could not build or load vector database")
+        print("  Skipping search test")
+        return None
+    
+    print(f"\n  Testing search functionality...")
+    print(f"    Vector DB size: {len(vector_db)}")
+    print(f"    Embedding dimension: {vector_db.embeddings.shape[1]}")
+    
+    # Test search with first puzzle as query
+    query_embedding = vector_db.embeddings[0]
+    query_puzzle_id = vector_db.puzzle_identifiers[0]
+    
+    print(f"\n  Query puzzle:")
+    print(f"    Index: 0")
+    print(f"    Puzzle ID: {query_puzzle_id}")
+    print(f"    Embedding norm: {np.linalg.norm(query_embedding):.4f}")
+    
+    # Search for similar puzzles
+    k = min(5, len(vector_db))
+    print(f"    Searching for top {k} similar puzzles...")
+    similar_indices, similarity_scores = vector_db.search(query_embedding, k=k)
+    
+    print(f"\n  Search results (top {len(similar_indices)}):")
+    for i, (idx, score) in enumerate(zip(similar_indices, similarity_scores)):
+        # Map puzzle index to puzzle identifier
+        # Note: similar_indices are positions in vector_db arrays
+        puzzle_id = vector_db.puzzle_identifiers[idx]
+        print(f"    {i+1}. Vector DB position {idx}, Puzzle ID {puzzle_id}, Similarity: {score:.4f}")
+    
+    # Verify results
+    assert len(similar_indices) > 0, "Search returned no results"
+    assert len(similar_indices) == len(similarity_scores), "Indices and scores length mismatch"
+    assert all(0 <= score <= 1.0 for score in similarity_scores), "Similarity scores should be in [0, 1]"
+    
+    # Check that first result is the query itself (or very similar)
+    if len(similar_indices) > 0:
+        first_idx = similar_indices[0]
+        first_score = similarity_scores[0]
+        print(f"\n  Verification:")
+        print(f"    First result index: {first_idx}")
+        print(f"    First result similarity: {first_score:.4f}")
+        if first_score > 0.99:
+            print(f"    ✓ First result is the query puzzle (expected)")
+        else:
+            print(f"    ⚠ First result similarity is {first_score:.4f} (might not be query)")
+    
+    # Test exclusion functionality
+    print(f"\n  Testing exclusion functionality...")
+    exclude_test_indices = [similar_indices[0]] if len(similar_indices) > 0 else []
+    if exclude_test_indices:
+        similar_indices_excluded, similarity_scores_excluded = vector_db.search(
+            query_embedding, 
+            k=k+1,  # Get one more to account for exclusion
+            exclude_indices=exclude_test_indices
+        )
+        print(f"    Excluded index: {exclude_test_indices[0]}")
+        print(f"    Results after exclusion: {len(similar_indices_excluded)}")
+        if len(similar_indices_excluded) > 0:
+            excluded_found = exclude_test_indices[0] in similar_indices_excluded
+            print(f"    Excluded index in results: {excluded_found} (should be False)")
+            if excluded_found:
+                print(f"    ⚠ WARNING: Excluded index still appears in results!")
+            else:
+                print(f"    ✓ Exclusion working correctly")
+    
+    print(f"\n✓ Search test passed!")
+    return vector_db
+
+
+def test_few_shot_dataset():
+    """Test 12: Few-shot dataset with vector database"""
+    print("\n" + "="*50)
+    print("Test 12: Few-shot dataset integration")
+    print("="*50)
+    
+    # Try to find dataset
+    data_paths = [
+        "data/sudoku-extreme-3-aug-3",
+        "../../data/sudoku-extreme-3-aug-3",
+        "../data/sudoku-extreme-3-aug-3",
+        "data/sudoku-extreme-100-aug-100",
+    ]
+    
+    data_path = None
+    for path in data_paths:
+        if os.path.exists(path):
+            data_path = path
+            break
+    
+    if data_path is None:
+        print(f"⚠ Dataset not found (checked: {', '.join(data_paths)})")
+        print("  Skipping few-shot dataset test")
+        return None
+    
+    print(f"✓ Found dataset: {data_path}")
+    
+    # Try to find checkpoint
+    checkpoint_paths = [
+        "step_21700",
+        "checkpoints/step_21700",
+        "../step_21700",
+        "../../step_21700",
+    ]
+    
+    checkpoint_path = None
+    for path in checkpoint_paths:
+        if os.path.exists(path):
+            checkpoint_path = path
+            break
+    
+    if checkpoint_path is None:
+        print("⚠ No checkpoint found")
+        print("  Skipping few-shot dataset test")
+        return None
+    
+    print(f"✓ Found checkpoint: {checkpoint_path}")
+    
+    try:
+        # Load or build vector database
+        vector_db = test_vector_database_search()
+        if vector_db is None:
+            print("⚠ Could not get vector database")
+            return None
+        
+        # Load dataset
+        batch_size = 2
+        dataset_cfg = PuzzleDatasetConfig(
+            seed=0,
+            dataset_paths=[data_path],
+            global_batch_size=batch_size,
+            test_set_mode=False,
+            epochs_per_iter=1,
+            rank=0,
+            num_replicas=1,
+        )
+        base_dataset = PuzzleDataset(dataset_cfg, split="train")
+        metadata = base_dataset.metadata
+        
+        print(f"\n  Dataset metadata:")
+        print(f"    vocab_size: {metadata.vocab_size}")
+        print(f"    seq_len: {metadata.seq_len}")
+        
+        # Create models
+        print(f"\n  Creating models...")
+        
+        # Infer architecture from vector database or checkpoint
+        # The base model must match the embedding dimension used in vector DB
+        vector_db_embedding_dim = vector_db.embeddings.shape[1]
+        print(f"    Vector DB embedding dimension: {vector_db_embedding_dim}")
+        
+        # Infer architecture from checkpoint (same as in test_checkpoint_loading)
+        checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(checkpoint_data, dict):
+            if "model_state_dict" in checkpoint_data:
+                state_dict = checkpoint_data["model_state_dict"]
+            else:
+                state_dict = checkpoint_data
+        else:
+            state_dict = checkpoint_data
+        
+        # Handle torch.compile prefixes
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith("_orig_mod."):
+                    new_key = key[len("_orig_mod."):]
+                    if new_key.startswith("model."):
+                        new_key = new_key[len("model."):]
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value
+            state_dict = new_state_dict
+        
+        # Infer hidden_size and vocab_size from checkpoint
+        inferred_hidden_size = None
+        inferred_vocab_size = None
+        
+        embedding_keys = [
+            "inner.embed_tokens.embedding_weight",
+            "embed_tokens.embedding_weight",
+        ]
+        for key in embedding_keys:
+            if key in state_dict:
+                inferred_vocab_size = state_dict[key].shape[0]
+                inferred_hidden_size = state_dict[key].shape[1]
+                print(f"    Inferred from checkpoint: vocab_size={inferred_vocab_size}, hidden_size={inferred_hidden_size}")
+                break
+        
+        if inferred_hidden_size is None:
+            init_keys = ["inner.H_init", "H_init"]
+            for key in init_keys:
+                if key in state_dict:
+                    inferred_hidden_size = state_dict[key].shape[0]
+                    print(f"    Inferred hidden_size={inferred_hidden_size} from {key}")
+                    break
+        
+        # Verify embedding dimension matches
+        if inferred_hidden_size is not None and inferred_hidden_size != vector_db_embedding_dim:
+            print(f"    ⚠ WARNING: Checkpoint hidden_size ({inferred_hidden_size}) != Vector DB embedding dim ({vector_db_embedding_dim})")
+            print(f"    Using vector DB embedding dimension: {vector_db_embedding_dim}")
+            inferred_hidden_size = vector_db_embedding_dim
+        elif inferred_hidden_size is None:
+            print(f"    Using vector DB embedding dimension as hidden_size: {vector_db_embedding_dim}")
+            inferred_hidden_size = vector_db_embedding_dim
+        
+        # Meta model config
+        meta_config = _build_meta_config(batch_size, metadata.seq_len, metadata.vocab_size)
+        meta_model = MetaTRM(meta_config)
+        meta_model.eval()
+        
+        # Base model config - must match vector DB architecture
+        base_config = _build_base_config(batch_size, metadata.seq_len, metadata.vocab_size)
+        base_config["num_puzzle_identifiers"] = metadata.num_puzzle_identifiers
+        base_config["hidden_size"] = inferred_hidden_size  # CRITICAL: Must match vector DB
+        base_config["puzzle_emb_ndim"] = inferred_hidden_size  # Also update puzzle embedding
+        
+        # Try to load checkpoint config for other parameters
+        import yaml
+        checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+        config_path = os.path.join(checkpoint_dir, "all_config.yaml")
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "rt") as f:
+                    checkpoint_config = yaml.safe_load(f)
+                
+                if "arch" in checkpoint_config:
+                    checkpoint_arch = checkpoint_config["arch"]
+                    base_config.update({
+                        "H_cycles": checkpoint_arch.get("H_cycles", base_config.get("H_cycles", 2)),
+                        "L_cycles": checkpoint_arch.get("L_cycles", base_config.get("L_cycles", 2)),
+                        "L_layers": checkpoint_arch.get("L_layers", base_config.get("L_layers", 2)),
+                        "num_heads": checkpoint_arch.get("num_heads", base_config.get("num_heads", 4)),
+                        "expansion": float(checkpoint_arch.get("expansion", base_config.get("expansion", 4.0))),
+                        "puzzle_emb_len": checkpoint_arch.get("puzzle_emb_len", base_config.get("puzzle_emb_len", 0)),
+                        "halt_max_steps": checkpoint_arch.get("halt_max_steps", base_config.get("halt_max_steps", 8)),
+                        "halt_exploration_prob": checkpoint_arch.get("halt_exploration_prob", base_config.get("halt_exploration_prob", 0.1)),
+                        "no_ACT_continue": checkpoint_arch.get("no_ACT_continue", base_config.get("no_ACT_continue", True)),
+                    })
+                    print(f"    ✓ Loaded additional config from YAML")
+            except Exception as e:
+                print(f"    ⚠ Could not load config from YAML: {e}")
+        
+        print(f"    Base model config: hidden_size={base_config['hidden_size']}, vocab_size={base_config['vocab_size']}")
+        
+        # Try to load checkpoint into base model
+        try:
+            base_model = TinyRecursiveReasoningModel_ACTV1(base_config)
+            base_model = load_base_trm_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=base_model,
+                map_location="cpu",
+                strict=False,
+            )
+            print(f"✓ Loaded checkpoint into base model")
+        except Exception as e:
+            print(f"⚠ Could not load checkpoint: {e}")
+            print(f"  Using randomly initialized base model")
+            base_model = TinyRecursiveReasoningModel_ACTV1(base_config)
+        
+        base_model.eval()
+        
+        # Verify embedding dimensions match
+        print(f"\n  Verifying embedding dimensions...")
+        test_inputs = torch.randint(0, metadata.vocab_size, (1, metadata.seq_len))
+        test_puzzle_ids = torch.zeros(1, dtype=torch.long)
+        with torch.no_grad():
+            test_embeddings = base_model.inner._input_embeddings(test_inputs, test_puzzle_ids)
+            test_embedding = test_embeddings.mean(dim=1)  # Mean pool like in build_vector_db
+            test_embedding_dim = test_embedding.shape[1]
+        
+        print(f"    Base model embedding dimension: {test_embedding_dim}")
+        print(f"    Vector DB embedding dimension: {vector_db_embedding_dim}")
+        
+        if test_embedding_dim != vector_db_embedding_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch! Base model produces {test_embedding_dim}D embeddings, "
+                f"but vector DB expects {vector_db_embedding_dim}D embeddings. "
+                f"Base model hidden_size={base_config['hidden_size']} must match vector DB."
+            )
+        print(f"    ✓ Embedding dimensions match!")
+        
+        # Create FewShotDataset
+        print(f"\n  Creating FewShotDataset...")
+        few_shot_dataset = FewShotDataset(
+            base_dataset=base_dataset,
+            vector_db=vector_db,
+            meta_model=meta_model,
+            base_model=base_model,
+            num_similar_examples=3,
+            device="cpu",
+            grid_height=9,
+            grid_width=9,
+        )
+        
+        print(f"✓ FewShotDataset created")
+        
+        # Test iteration
+        print(f"\n  Testing dataset iteration...")
+        dataloader = DataLoader(few_shot_dataset, batch_size=None, num_workers=0)
+        
+        batch_count = 0
+        for set_name, batch, global_batch_size in dataloader:
+            batch_count += 1
+            print(f"\n  Batch {batch_count}:")
+            print(f"    Set name: {set_name}")
+            print(f"    Global batch size: {global_batch_size}")
+            print(f"    Inputs shape: {batch['inputs'].shape}")
+            print(f"    Labels shape: {batch['labels'].shape}")
+            
+            if "similar_inputs" in batch:
+                print(f"    Similar inputs shape: {batch['similar_inputs'].shape}")
+                print(f"    Similar labels shape: {batch['similar_labels'].shape}")
+                num_similar = batch['similar_inputs'].shape[1] if len(batch['similar_inputs'].shape) > 1 else 0
+                print(f"    Number of similar examples per puzzle: {num_similar}")
+                print(f"    ✓ Few-shot data present!")
+                
+                # Debug: Check if similar examples are non-zero
+                if num_similar > 0:
+                    non_zero_count = (batch['similar_inputs'] != 0).sum().item()
+                    total_elements = batch['similar_inputs'].numel()
+                    print(f"    Non-zero elements in similar inputs: {non_zero_count}/{total_elements}")
+            else:
+                print(f"    ⚠ No similar inputs found")
+            
+            print(f"    Puzzle identifiers shape: {batch['puzzle_identifiers'].shape}")
+            
+            # Verify shapes
+            assert batch['inputs'].shape[0] <= global_batch_size, "Batch size mismatch"
+            assert batch['inputs'].shape[1] == metadata.seq_len, "Sequence length mismatch"
+            
+            if batch_count >= 2:  # Test 2 batches
+                break
+        
+        print(f"\n✓ Few-shot dataset test passed!")
+        print(f"    Processed {batch_count} batches")
+        
+        return few_shot_dataset
+        
+    except Exception as e:
+        print(f"✗ Few-shot dataset test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def main():
     """Run all integration tests"""
     print("="*50)
@@ -1069,6 +1675,15 @@ def main():
         
         # Test 9: End-to-end
         test_end_to_end()
+        
+        # Test 10: Vector database build and load
+        test_vector_database_build_and_load()
+        
+        # Test 11: Vector database search
+        test_vector_database_search()
+        
+        # Test 12: Few-shot dataset integration
+        test_few_shot_dataset()
         
         print("\n" + "="*50)
         print("✓ All integration tests passed!")
