@@ -52,8 +52,11 @@ def encode_puzzle_batch(
         # Pool to: [batch_size, hidden_size]
         embeddings = input_embeddings.mean(dim=1)  # Mean pool over sequence
         
-        # Convert to numpy
-        embeddings_np = embeddings.cpu().numpy()
+        # Convert to numpy (cast to float32 first to handle bfloat16 and other unsupported dtypes)
+        # This is necessary because NumPy cannot directly convert bfloat16 tensors
+        # Always cast to float32 to ensure compatibility
+        embeddings = embeddings.to(dtype=torch.float32).cpu()
+        embeddings_np = embeddings.numpy()
         
         return embeddings_np
 
@@ -83,6 +86,64 @@ def build_vector_database(
     print(f"Data paths: {data_paths}")
     print(f"Output path: {output_path}")
     
+    # Try to find a valid split by checking which directories exist
+    # Common splits: train, test, all
+    valid_split = None
+    for split_name in ["train", "test", "all"]:
+        for data_path in data_paths:
+            metadata_path = os.path.join(data_path, split_name, "dataset.json")
+            if os.path.exists(metadata_path):
+                valid_split = split_name
+                print(f"Found dataset metadata at: {metadata_path}")
+                break
+        if valid_split:
+            break
+    
+    if valid_split is None:
+        # Try checking if dataset.json is directly in the data path
+        for data_path in data_paths:
+            metadata_path = os.path.join(data_path, "dataset.json")
+            if os.path.exists(metadata_path):
+                # Check if "all" directory exists (common structure)
+                all_dir = os.path.join(data_path, "all")
+                if os.path.exists(all_dir):
+                    valid_split = "all"
+                    print(f"Found dataset metadata at root: {metadata_path}")
+                    print(f"Using 'all' split directory")
+                    break
+                else:
+                    # If no split directory, try to use the metadata directly
+                    # But PuzzleDataset expects split subdirectory, so we'll need to handle this
+                    print(f"Warning: Found metadata at root but no split directory found")
+                    print(f"Trying to use 'all' split anyway (may fail if structure is different)")
+                    valid_split = "all"
+                    break
+    
+    if valid_split is None:
+        # Provide diagnostic information
+        error_msg = f"Could not find dataset.json in any expected location.\n"
+        error_msg += f"Checked paths:\n"
+        for data_path in data_paths:
+            error_msg += f"  Data path: {data_path}\n"
+            if os.path.exists(data_path):
+                error_msg += f"    Directory exists: Yes\n"
+                # List what's actually in the directory
+                try:
+                    contents = os.listdir(data_path)
+                    error_msg += f"    Contents: {contents}\n"
+                    # Check each subdirectory
+                    for item in contents:
+                        item_path = os.path.join(data_path, item)
+                        if os.path.isdir(item_path):
+                            sub_contents = os.listdir(item_path)
+                            error_msg += f"      {item}/: {sub_contents[:10]}{'...' if len(sub_contents) > 10 else ''}\n"
+                except Exception as e:
+                    error_msg += f"    Could not list contents: {e}\n"
+            else:
+                error_msg += f"    Directory exists: No\n"
+        
+        raise FileNotFoundError(error_msg)
+    
     # Load dataset metadata
     dataset_config = PuzzleDatasetConfig(
         seed=seed,
@@ -93,7 +154,7 @@ def build_vector_database(
         rank=0,
         num_replicas=1,
     )
-    dataset = PuzzleDataset(dataset_config, split="train")
+    dataset = PuzzleDataset(dataset_config, split=valid_split)
     metadata = dataset.metadata
     
     print(f"Dataset metadata: {metadata}")
