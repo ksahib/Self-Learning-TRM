@@ -347,10 +347,18 @@ def train_meta_batch(
         similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
         similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
         
+        # Use actual puzzle identifiers from similar examples if available, otherwise fallback to original puzzle IDs
+        if "similar_puzzle_identifiers" in train_batch:
+            similar_puzzle_ids = train_batch["similar_puzzle_identifiers"]  # [batch_size, num_similar]
+            similar_puzzle_ids_flat = similar_puzzle_ids.reshape(-1)  # [batch_size * num_similar]
+        else:
+            # Fallback: use original puzzle identifiers (for backward compatibility)
+            similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
+        
         few_shot_train_batch = {
             "inputs": similar_inputs_flat,
             "labels": similar_labels_flat,
-            "puzzle_identifiers": train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0),
+            "puzzle_identifiers": similar_puzzle_ids_flat,
         }
     
     (

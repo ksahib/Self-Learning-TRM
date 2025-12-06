@@ -265,6 +265,7 @@ class FewShotDataset(IterableDataset):
             # Lists to collect similar examples
             all_similar_inputs = []
             all_similar_labels = []
+            all_similar_puzzle_ids = []
             
             # Process each puzzle in batch
             # Move models to device on-demand (safe with num_workers=0)
@@ -283,7 +284,7 @@ class FewShotDataset(IterableDataset):
                 query_puzzle_identifier = int(original_puzzle_identifiers[i])
                 
                 # Get similar examples
-                similar_inputs_np, similar_labels_np, _ = self._get_similar_examples(
+                similar_inputs_np, similar_labels_np, similar_puzzle_ids_np = self._get_similar_examples(
                     query_embedding,
                     query_puzzle_identifier,
                     dataset_data,
@@ -292,7 +293,12 @@ class FewShotDataset(IterableDataset):
                 # Convert to tensors
                 similar_inputs = torch.from_numpy(similar_inputs_np).to(self.device)
                 similar_labels = torch.from_numpy(similar_labels_np).to(self.device)
-                similar_puzzle_ids = torch.zeros(len(similar_inputs_np), dtype=torch.long, device=self.device)
+                # Use actual puzzle identifiers from similar examples (or fallback to query puzzle ID if empty)
+                if len(similar_puzzle_ids_np) > 0:
+                    similar_puzzle_ids = torch.from_numpy(similar_puzzle_ids_np).to(self.device)
+                else:
+                    # Fallback: use query puzzle identifier if no similar examples found
+                    similar_puzzle_ids = torch.full((0,), query_puzzle_identifier, dtype=torch.long, device=self.device)
                 
                 # Apply MetaTRM augmentations
                 if len(similar_inputs) > 0:
@@ -304,10 +310,13 @@ class FewShotDataset(IterableDataset):
                     )
                     all_similar_inputs.append(aug_inputs.cpu().numpy())
                     all_similar_labels.append(aug_labels.cpu().numpy())
+                    # Store puzzle identifiers for augmented examples
+                    all_similar_puzzle_ids.append(similar_puzzle_ids.cpu().numpy())
                 else:
                     # Empty similar examples
                     all_similar_inputs.append(np.zeros((0, self.metadata.seq_len), dtype=np.int32))
                     all_similar_labels.append(np.zeros((0, self.metadata.seq_len), dtype=np.int32))
+                    all_similar_puzzle_ids.append(np.zeros((0,), dtype=np.int32))
             
             # Stack similar examples
             # Pad to same number of examples per puzzle
@@ -317,21 +326,28 @@ class FewShotDataset(IterableDataset):
                 # Pad and stack
                 padded_similar_inputs = []
                 padded_similar_labels = []
+                padded_similar_puzzle_ids = []
                 
-                for sim_inputs, sim_labels in zip(all_similar_inputs, all_similar_labels):
+                for sim_inputs, sim_labels, sim_puzzle_ids in zip(all_similar_inputs, all_similar_labels, all_similar_puzzle_ids):
                     if len(sim_inputs) < max_similar:
                         pad_size = max_similar - len(sim_inputs)
                         sim_inputs = np.pad(sim_inputs, ((0, pad_size), (0, 0)), constant_values=self.metadata.pad_id)
                         sim_labels = np.pad(sim_labels, ((0, pad_size), (0, 0)), constant_values=-100)
+                        # Pad puzzle identifiers with the last valid identifier (or 0 if empty)
+                        pad_value = int(sim_puzzle_ids[-1]) if len(sim_puzzle_ids) > 0 else 0
+                        sim_puzzle_ids = np.pad(sim_puzzle_ids, (0, pad_size), constant_values=pad_value)
                     padded_similar_inputs.append(sim_inputs)
                     padded_similar_labels.append(sim_labels)
+                    padded_similar_puzzle_ids.append(sim_puzzle_ids)
                 
                 similar_inputs_stacked = np.stack(padded_similar_inputs)  # [batch_size, max_similar, seq_len]
                 similar_labels_stacked = np.stack(padded_similar_labels)  # [batch_size, max_similar, seq_len]
+                similar_puzzle_ids_stacked = np.stack(padded_similar_puzzle_ids)  # [batch_size, max_similar]
             else:
                 # No similar examples
                 similar_inputs_stacked = np.zeros((batch_size, 0, self.metadata.seq_len), dtype=np.int32)
                 similar_labels_stacked = np.zeros((batch_size, 0, self.metadata.seq_len), dtype=np.int32)
+                similar_puzzle_ids_stacked = np.zeros((batch_size, 0), dtype=np.int32)
             
             # Create output batch
             output_batch = {
@@ -339,6 +355,7 @@ class FewShotDataset(IterableDataset):
                 "labels": original_labels,  # Original labels (will be masked in loss)
                 "similar_inputs": similar_inputs_stacked,  # Augmented similar examples
                 "similar_labels": similar_labels_stacked,  # Augmented similar labels
+                "similar_puzzle_identifiers": similar_puzzle_ids_stacked,  # Puzzle identifiers for similar examples
                 "puzzle_identifiers": original_puzzle_identifiers,
                 "is_original": np.ones(batch_size, dtype=bool),  # All are originals
             }
