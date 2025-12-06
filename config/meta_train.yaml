@@ -84,9 +84,9 @@ device: "cuda"
 loss_type: "softmax_cross_entropy"  # or "stablemax_cross_entropy"
 
 # Few-shot training (SEAL-style)
-use_few_shot: False  # Enable few-shot training
-num_similar_examples: 3  # Number of similar examples to fetch per puzzle
-vector_db_path: null  # Path to vector database file (required if use_few_shot=True)
+use_few_shot: True  # Enable few-shot training
+num_similar_examples: 20  # Number of similar examples to fetch per puzzle
+vector_db_path: "vector_db/sudoku-extreme-100-aug-100.npz"   # Path to vector database file (required if use_few_shot=True)
 rebuild_vector_db: False  # Force rebuild vector database
 meta_trm_config: null  # MetaTRM config for few-shot (uses training MetaTRM if null)
 meta_trm_checkpoint: null  # MetaTRM checkpoint (optional, uses training MetaTRM if null)
