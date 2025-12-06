@@ -135,13 +135,18 @@ def create_dataloader(
     else:
         dataset = base_dataset
     
+    # Use num_workers=0 when using few-shot dataset to avoid CUDA initialization issues in worker processes
+    # Few-shot dataset needs to run models (base_model, meta_model) which requires CUDA
+    # CUDA cannot be initialized in forked worker processes
+    use_workers = 0 if config.use_few_shot and split == "train" else 1
+    
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=1,
-        prefetch_factor=8,
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=use_workers,
+        prefetch_factor=8 if use_workers > 0 else None,
+        pin_memory=True if use_workers > 0 else False,
+        persistent_workers=True if use_workers > 0 else False
     )
     return dataloader, dataset.metadata
 

@@ -61,20 +61,21 @@ class FewShotDataset(IterableDataset):
         self.metadata = base_dataset.metadata
         self.config = base_dataset.config
         
-        # Move models to device
-        self.meta_model = self.meta_model.to(device)
-        self.base_model = self.base_model.to(device)
+        # Store device but don't move models here (will be moved when needed)
+        # Models will be moved to device on-demand to avoid CUDA issues in worker processes
         self.base_model.eval()
         self.meta_model.eval()
     
     def _encode_puzzle(self, inputs: torch.Tensor, puzzle_identifiers: torch.Tensor) -> np.ndarray:
         """Encode a puzzle to get its embedding."""
+        # Move models and inputs to device on-demand (not in __init__ to avoid CUDA in workers)
+        base_model = self.base_model.to(self.device)
         with torch.no_grad():
             inputs = inputs.to(self.device)
             puzzle_identifiers = puzzle_identifiers.to(self.device)
             
             # Get input embeddings
-            input_embeddings = self.base_model.inner._input_embeddings(inputs, puzzle_identifiers)
+            input_embeddings = base_model.inner._input_embeddings(inputs, puzzle_identifiers)
             
             # Mean pool to get fixed-size embedding
             embedding = input_embeddings.mean(dim=1)  # [batch_size, hidden_size]
@@ -164,9 +165,16 @@ class FewShotDataset(IterableDataset):
         similar_inputs: torch.Tensor,
         similar_labels: torch.Tensor,
         similar_puzzle_identifiers: torch.Tensor,
+        meta_model=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Use MetaTRM to select and apply augmentations to similar examples.
+        
+        Args:
+            similar_inputs: Input tensors (already on device)
+            similar_labels: Label tensors (already on device)
+            similar_puzzle_identifiers: Puzzle identifier tensors (already on device)
+            meta_model: MetaTRM model (if None, uses self.meta_model)
         
         Returns:
             Tuple of (augmented_inputs, augmented_labels)
@@ -174,6 +182,10 @@ class FewShotDataset(IterableDataset):
         # Handle empty batch
         if len(similar_inputs) == 0:
             return similar_inputs, similar_labels
+        
+        # Use provided meta_model or fall back to self.meta_model
+        if meta_model is None:
+            meta_model = self.meta_model.to(self.device)
         
         # Create batch dict for MetaTRM
         batch = {
@@ -183,8 +195,8 @@ class FewShotDataset(IterableDataset):
         }
         
         # Get augmentation patterns from MetaTRM
-        meta_carry = self.meta_model.initial_carry(batch)
-        meta_carry, meta_outputs = self.meta_model(
+        meta_carry = meta_model.initial_carry(batch)
+        meta_carry, meta_outputs = meta_model(
             meta_carry,
             batch,
             sample=True,
@@ -253,6 +265,10 @@ class FewShotDataset(IterableDataset):
             all_similar_labels = []
             
             # Process each puzzle in batch
+            # Move models to device on-demand (safe with num_workers=0)
+            base_model = self.base_model.to(self.device)
+            meta_model = self.meta_model.to(self.device)
+            
             for i in range(batch_size):
                 # Get original puzzle (never augmented)
                 orig_input = torch.from_numpy(original_inputs[i:i+1]).to(self.device)
@@ -282,6 +298,7 @@ class FewShotDataset(IterableDataset):
                         similar_inputs,
                         similar_labels,
                         similar_puzzle_ids,
+                        meta_model=meta_model,
                     )
                     all_similar_inputs.append(aug_inputs.cpu().numpy())
                     all_similar_labels.append(aug_labels.cpu().numpy())
