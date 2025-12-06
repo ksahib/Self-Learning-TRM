@@ -9,8 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
-import yaml
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -220,10 +219,12 @@ def main():
     
     args = parser.parse_args()
     
-    # Load arch config if provided
+        # Load arch config if provided
     if args.arch_config:
-        with open(args.arch_config, "r") as f:
-            arch_config = yaml.safe_load(f)
+        from omegaconf import OmegaConf
+        arch_config = OmegaConf.load(args.arch_config)
+        # Convert to regular dict and resolve interpolations
+        arch_config = OmegaConf.to_container(arch_config, resolve=True)
     else:
         # Default config (will need to be provided)
         raise ValueError("--arch_config is required")
