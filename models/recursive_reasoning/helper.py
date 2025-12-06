@@ -700,9 +700,16 @@ def compute_rewards_from_augmentations(
         
         # 3b. Get training batch (few-shot or augmented original)
         if few_shot_train_batch is not None:
-            # Few-shot mode: use similar examples directly (already augmented by FewShotDataset using MetaTRM)
-            # The patterns are still sampled for consistency, but we use the pre-augmented similar examples
-            aug_batch = few_shot_train_batch
+            # Check if batch is actually non-empty
+            if few_shot_train_batch["inputs"].shape[0] == 0 or few_shot_train_batch["puzzle_identifiers"].shape[0] == 0:
+                # Empty batch, fall back to standard augmentation
+                aug_batch = apply_augmentation_patterns_to_batch(
+                    original_batch, [pattern], grid_height=grid_height, grid_width=grid_width
+                )
+            else:
+                # Few-shot mode: use similar examples directly (already augmented by FewShotDataset using MetaTRM)
+                # The patterns are still sampled for consistency, but we use the pre-augmented similar examples
+                aug_batch = few_shot_train_batch
         else:
             # Standard mode: apply augmentation to original batch
             aug_batch = apply_augmentation_patterns_to_batch(

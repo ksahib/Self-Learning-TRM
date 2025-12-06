@@ -343,23 +343,35 @@ def train_meta_batch(
         batch_size = similar_inputs.shape[0]
         num_similar = similar_inputs.shape[1]
         
-        # Flatten similar examples for training
-        similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
-        similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
-        
-        # Use actual puzzle identifiers from similar examples if available, otherwise fallback to original puzzle IDs
-        if "similar_puzzle_identifiers" in train_batch:
-            similar_puzzle_ids = train_batch["similar_puzzle_identifiers"]  # [batch_size, num_similar]
-            similar_puzzle_ids_flat = similar_puzzle_ids.reshape(-1)  # [batch_size * num_similar]
-        else:
-            # Fallback: use original puzzle identifiers (for backward compatibility)
-            similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
-        
-        few_shot_train_batch = {
-            "inputs": similar_inputs_flat,
-            "labels": similar_labels_flat,
-            "puzzle_identifiers": similar_puzzle_ids_flat,
-        }
+        # Only create few-shot batch if we have actual similar examples
+        if num_similar > 0 and similar_inputs.numel() > 0:
+            # Flatten similar examples for training
+            similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
+            similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
+            
+            # Use actual puzzle identifiers from similar examples if available, otherwise fallback to original puzzle IDs
+            if "similar_puzzle_identifiers" in train_batch:
+                similar_puzzle_ids = train_batch["similar_puzzle_identifiers"]  # [batch_size, num_similar]
+                similar_puzzle_ids_flat = similar_puzzle_ids.reshape(-1)  # [batch_size * num_similar]
+            else:
+                # Fallback: use original puzzle identifiers (for backward compatibility)
+                similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
+            
+            # Verify we have non-empty tensors with valid puzzle identifiers
+            if similar_inputs_flat.shape[0] > 0 and similar_puzzle_ids_flat.shape[0] > 0:
+                # Additional check: ensure puzzle identifiers are valid (within bounds)
+                # Get num_puzzle_identifiers from base model config
+                max_puzzle_id = base_model.config.num_puzzle_identifiers - 1
+                if similar_puzzle_ids_flat.min() >= 0 and similar_puzzle_ids_flat.max() <= max_puzzle_id:
+                    few_shot_train_batch = {
+                        "inputs": similar_inputs_flat,
+                        "labels": similar_labels_flat,
+                        "puzzle_identifiers": similar_puzzle_ids_flat,
+                    }
+                else:
+                    # Invalid puzzle identifiers, skip few-shot batch
+                    print(f"Warning: Invalid puzzle identifiers detected (min={similar_puzzle_ids_flat.min()}, max={similar_puzzle_ids_flat.max()}, allowed=[0, {max_puzzle_id}]). Skipping few-shot batch.")
+        # If empty or invalid, few_shot_train_batch remains None and we'll use standard augmentation
     
     (
         rewards,
