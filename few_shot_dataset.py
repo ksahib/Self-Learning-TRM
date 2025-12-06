@@ -80,7 +80,9 @@ class FewShotDataset(IterableDataset):
             # Mean pool to get fixed-size embedding
             embedding = input_embeddings.mean(dim=1)  # [batch_size, hidden_size]
             
-            return embedding.cpu().numpy()
+            # Convert to numpy (cast to float32 first to handle bfloat16)
+            embedding = embedding.to(dtype=torch.float32).cpu()
+            return embedding.numpy()
     
     def _get_similar_examples(
         self,

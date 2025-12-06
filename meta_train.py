@@ -344,8 +344,8 @@ def train_meta_batch(
         num_similar = similar_inputs.shape[1]
         
         # Flatten similar examples for training
-        similar_inputs_flat = similar_inputs.view(-1, similar_inputs.shape[-1])
-        similar_labels_flat = similar_labels.view(-1, similar_labels.shape[-1])
+        similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
+        similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])  # Changed from view to reshape for PyTorch 2.8.0 compatibility
         
         few_shot_train_batch = {
             "inputs": similar_inputs_flat,
