@@ -637,6 +637,8 @@ def compute_rewards_from_augmentations(
     loss_type: str = "softmax_cross_entropy",
     grid_height: int = 9,
     grid_width: int = 9,
+    few_shot_train_batch: Optional[Dict[str, torch.Tensor]] = None,
+    meta_model: Optional["MetaTRM"] = None,
 ) -> Tuple[
     List[float],
     float,
@@ -647,7 +649,7 @@ def compute_rewards_from_augmentations(
     Complete flow matching requ.txt: Fine-tune on augmented data → Evaluate on original input.
     
     For each augmentation pattern:
-    1. Apply augmentation to original batch
+    1. Apply augmentation to original batch (or use few-shot batch if provided)
     2. Fine-tune base TRM with LoRA on augmented batch
     3. Evaluate fine-tuned model on ORIGINAL (non-augmented) batch
     4. Compute binary reward: 1 if loss improved, 0 if not
@@ -664,6 +666,9 @@ def compute_rewards_from_augmentations(
         loss_type: Type of loss function ('softmax_cross_entropy' or 'stablemax_cross_entropy')
         grid_height: Height of grid (default 9 for Sudoku)
         grid_width: Width of grid (default 9 for Sudoku)
+        few_shot_train_batch: Optional few-shot training batch (already augmented by FewShotDataset).
+                             If provided, this is used for fine-tuning instead of applying patterns to original_batch.
+        meta_model: Optional MetaTRM model (not used currently, but kept for future use)
     
     Returns:
         rewards: List of reward values (one per pattern), e.g., [0.0, 1.0, 0.0]
@@ -693,10 +698,16 @@ def compute_rewards_from_augmentations(
         # 3a. Restore base model to original state
         base_model.load_state_dict(original_state)
         
-        # 3b. Apply augmentation to batch (for fine-tuning)
-        aug_batch = apply_augmentation_patterns_to_batch(
-            original_batch, [pattern], grid_height=grid_height, grid_width=grid_width
-        )
+        # 3b. Get training batch (few-shot or augmented original)
+        if few_shot_train_batch is not None:
+            # Few-shot mode: use similar examples directly (already augmented by FewShotDataset using MetaTRM)
+            # The patterns are still sampled for consistency, but we use the pre-augmented similar examples
+            aug_batch = few_shot_train_batch
+        else:
+            # Standard mode: apply augmentation to original batch
+            aug_batch = apply_augmentation_patterns_to_batch(
+                original_batch, [pattern], grid_height=grid_height, grid_width=grid_width
+            )
         
         # 3c. Fine-tune base TRM with LoRA on augmented data
         base_model.train()

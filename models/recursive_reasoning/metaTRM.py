@@ -283,6 +283,14 @@ class MetaTRM(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> MetaTRMCarry:
         batch_size = batch["inputs"].shape[0]
+        # Handle empty batch
+        if batch_size == 0:
+            # Return empty carry with correct structure
+            device = batch["inputs"].device
+            return MetaTRMCarry(
+                inner_carry=self.inner.empty_carry(1),  # Use 1 for empty batch structure
+                current_data={k: torch.empty((0, *v.shape[1:]), dtype=v.dtype, device=device) for k, v in batch.items()},
+            )
         return MetaTRMCarry(
             inner_carry=self.inner.empty_carry(batch_size),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
@@ -297,6 +305,16 @@ class MetaTRM(nn.Module):
         temperature: float = 1.0,
         greedy: bool = False,
     ) -> Tuple[MetaTRMCarry, Dict[str, torch.Tensor]]:
+        # Handle empty batch
+        batch_size = batch["inputs"].shape[0]
+        if batch_size == 0:
+            # Return empty outputs
+            device = batch["inputs"].device
+            empty_aug_logits = torch.empty((0, self.config.aug_slots, self.config.choices_per_slot), device=device, dtype=self.inner.forward_dtype)
+            outputs: Dict[str, torch.Tensor] = {"aug_logits": empty_aug_logits}
+            outputs["sampled_patterns"] = []
+            return MetaTRMCarry(carry.inner_carry, batch), outputs
+        
         new_current_data = {k: batch[k] for k in batch}
         new_inner_carry, aug_logits = self.inner(carry.inner_carry, new_current_data)
 

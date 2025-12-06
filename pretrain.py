@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 import os
 import math
@@ -23,6 +23,10 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+from utils.vector_db import PuzzleVectorDB
+from models.recursive_reasoning.metaTRM import MetaTRM
+from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1
+from few_shot_dataset import FewShotDataset
 
 
 class LossConfig(pydantic.BaseModel):
@@ -82,6 +86,16 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    
+    # Few-shot training (SEAL-style)
+    use_few_shot: bool = False
+    num_similar_examples: int = 3
+    vector_db_path: Optional[str] = None
+    rebuild_vector_db: bool = False
+    meta_trm_config: Optional[Dict] = None
+    meta_trm_checkpoint: Optional[str] = None
+    grid_height: int = 9
+    grid_width: int = 9
 
 @dataclass
 class TrainState:
@@ -94,14 +108,39 @@ class TrainState:
     total_steps: int
 
 
-def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
+def create_dataloader(
+    config: PretrainConfig,
+    split: str,
+    rank: int,
+    world_size: int,
+    vector_db: Optional[PuzzleVectorDB] = None,
+    meta_model: Optional[MetaTRM] = None,
+    base_model: Optional[TinyRecursiveReasoningModel_ACTV1] = None,
+    **kwargs
+):
+    base_dataset = PuzzleDataset(PuzzleDatasetConfig(
         seed=config.seed,
         dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths,
         rank=rank,
         num_replicas=world_size,
         **kwargs
     ), split=split)
+    
+    # Wrap with FewShotDataset if enabled and training
+    if config.use_few_shot and split == "train" and vector_db is not None and meta_model is not None and base_model is not None:
+        dataset = FewShotDataset(
+            base_dataset=base_dataset,
+            vector_db=vector_db,
+            meta_model=meta_model,
+            base_model=base_model,
+            num_similar_examples=config.num_similar_examples,
+            device="cuda",
+            grid_height=config.grid_height,
+            grid_width=config.grid_width,
+        )
+    else:
+        dataset = base_dataset
+    
     dataloader = DataLoader(
         dataset,
         batch_size=None,
@@ -309,14 +348,78 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
+    
+    # Handle few-shot batches
+    if config.use_few_shot and "similar_inputs" in batch:
+        # Few-shot mode: train on similar examples, evaluate on originals
+        # Original puzzles: never augmented, labels masked in loss
+        # Similar examples: augmented, used for training
+        
+        # Mask original puzzle labels (they should not contribute to loss)
+        original_labels = batch["labels"].clone()
+        batch["labels"] = torch.full_like(original_labels, -100)  # IGNORE_LABEL_ID
+        
+        # Get similar examples
+        similar_inputs = batch["similar_inputs"]  # [batch_size, num_similar, seq_len]
+        similar_labels = batch["similar_labels"]  # [batch_size, num_similar, seq_len]
+        
+        batch_size = similar_inputs.shape[0]
+        num_similar = similar_inputs.shape[1]
+        
+        # Flatten similar examples for training
+        # Reshape to [batch_size * num_similar, seq_len]
+        similar_inputs_flat = similar_inputs.view(-1, similar_inputs.shape[-1])
+        similar_labels_flat = similar_labels.view(-1, similar_labels.shape[-1])
+        
+        # Create training batch from similar examples
+        train_batch_dict = {
+            "inputs": similar_inputs_flat,
+            "labels": similar_labels_flat,
+            "puzzle_identifiers": batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0),
+        }
+        
+        # Also need to evaluate on originals (for metrics only)
+        eval_batch_dict = {
+            "inputs": batch["inputs"],
+            "labels": original_labels,  # Restore original labels for evaluation
+            "puzzle_identifiers": batch["puzzle_identifiers"],
+        }
+        
+        # Init carry if needed
+        if train_state.carry is None:
+            with torch.device("cuda"):
+                train_state.carry = train_state.model.initial_carry(train_batch_dict)  # type: ignore
+        
+        # Forward on similar examples (training)
+        train_state.carry, loss, metrics, _, _ = train_state.model(
+            carry=train_state.carry,
+            batch=train_batch_dict,
+            return_keys=[]
+        )
+        
+        # Evaluate on originals (metrics only, no gradient)
+        with torch.no_grad():
+            eval_carry = train_state.model.initial_carry(eval_batch_dict)
+            _, _, eval_metrics, _, _ = train_state.model(
+                carry=eval_carry,
+                batch=eval_batch_dict,
+                return_keys=[]
+            )
+            # Merge eval metrics (prefix with "eval_original/")
+            for k, v in eval_metrics.items():
+                metrics[f"eval_original_{k}"] = v
+        
+        # Scale loss by number of similar examples
+        loss = loss / num_similar
+    else:
+        # Standard training mode
+        # Init carry if it is None
+        if train_state.carry is None:
+            with torch.device("cuda"):
+                train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
-
-    # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+        # Forward
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -576,13 +679,97 @@ def launch(hydra_config: DictConfig):
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
+    # Load vector database and MetaTRM if few-shot is enabled
+    vector_db = None
+    meta_model = None
+    base_model_for_fewshot = None
+    
+    if config.use_few_shot:
+        if RANK == 0:
+            print("Setting up few-shot training...")
+        
+        # Load vector database
+        if config.vector_db_path and os.path.exists(config.vector_db_path):
+            if RANK == 0:
+                print(f"Loading vector database from {config.vector_db_path}")
+            vector_db = PuzzleVectorDB.load(config.vector_db_path)
+            if RANK == 0:
+                print(f"Loaded vector database with {len(vector_db)} puzzles")
+        else:
+            raise ValueError(f"Vector database not found at {config.vector_db_path}. Please build it first using utils/build_vector_db.py")
+        
+        # Load or create MetaTRM
+        if config.meta_trm_config is None:
+            raise ValueError("meta_trm_config is required when use_few_shot=True")
+        
+        # Get base model for encoding (use the training model)
+        # We'll set this after creating train_state
+        
+        # MetaTRM will be initialized after we have metadata
+    
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     total_iters = config.epochs // train_epochs_per_iter
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    # Create base dataset first to get metadata
+    base_train_dataset = PuzzleDataset(PuzzleDatasetConfig(
+        seed=config.seed,
+        dataset_paths=config.data_paths,
+        rank=RANK,
+        num_replicas=WORLD_SIZE,
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+    ), split="train")
+    train_metadata = base_train_dataset.metadata
+    
+    # Train state (needed to extract base model for few-shot)
+    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    
+    # Initialize MetaTRM with metadata if needed
+    if config.use_few_shot:
+        # Extract base TRM model from wrapped model
+        # The model is wrapped with ACTLossHead, so we need to access .model
+        if hasattr(train_state.model, "model"):
+            base_model_for_fewshot = train_state.model.model
+        else:
+            base_model_for_fewshot = train_state.model
+        
+        if meta_model is None:
+            meta_model_cfg["vocab_size"] = train_metadata.vocab_size
+            meta_model_cfg["seq_len"] = train_metadata.seq_len
+            meta_model_cfg["num_puzzle_identifiers"] = train_metadata.num_puzzle_identifiers
+            
+            meta_model = MetaTRM(meta_model_cfg)
+            meta_model = meta_model.to("cuda")
+            
+            # Load MetaTRM checkpoint if provided
+            if config.meta_trm_checkpoint and os.path.exists(config.meta_trm_checkpoint):
+                if RANK == 0:
+                    print(f"Loading MetaTRM checkpoint from {config.meta_trm_checkpoint}")
+                checkpoint = torch.load(config.meta_trm_checkpoint, map_location="cuda")
+                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                    meta_model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                else:
+                    meta_model.load_state_dict(checkpoint, strict=False)
+                if RANK == 0:
+                    print("MetaTRM checkpoint loaded")
+    
+    # Create train loader (with few-shot wrapper if enabled)
+    train_loader, _ = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+        vector_db=vector_db,
+        meta_model=meta_model,
+        base_model=base_model_for_fewshot if config.use_few_shot else None,
+    )
     try:
         eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     except:
@@ -594,9 +781,6 @@ def launch(hydra_config: DictConfig):
     except:
         print("No evaluator found")
         evaluators = []
-
-    # Train state
-    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
     # Progress bar and logger
     progress_bar = None

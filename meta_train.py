@@ -25,6 +25,8 @@ from models.recursive_reasoning.helper import (
     load_base_trm_checkpoint,
     infer_vocab_size_from_checkpoint,
 )
+from utils.vector_db import PuzzleVectorDB
+from few_shot_dataset import FewShotDataset
 
 
 class MetaTrainConfig(BaseModel):
@@ -75,6 +77,16 @@ class MetaTrainConfig(BaseModel):
     eval_interval: int = 10
     device: str = "cuda"
     loss_type: str = "softmax_cross_entropy"
+    
+    # Few-shot training (SEAL-style)
+    use_few_shot: bool = False
+    num_similar_examples: int = 3
+    vector_db_path: Optional[str] = None
+    rebuild_vector_db: bool = False
+    meta_trm_config: Optional[Dict] = None
+    meta_trm_checkpoint: Optional[str] = None
+    grid_height: int = 9
+    grid_width: int = 9
 
 
 @dataclass
@@ -86,7 +98,14 @@ class MetaTrainState:
     total_steps: int
 
 
-def create_dataloader(config: MetaTrainConfig, split: str, **kwargs):
+def create_dataloader(
+    config: MetaTrainConfig,
+    split: str,
+    vector_db: Optional[PuzzleVectorDB] = None,
+    meta_model: Optional[MetaTRM] = None,
+    base_model: Optional[TinyRecursiveReasoningModel_ACTV1] = None,
+    **kwargs
+):
     dataset_paths = (
         config.data_paths_val if split == "val" and len(config.data_paths_val) > 0 else config.data_paths
     )
@@ -99,7 +118,23 @@ def create_dataloader(config: MetaTrainConfig, split: str, **kwargs):
         rank=kwargs.get("rank", 0),
         num_replicas=kwargs.get("num_replicas", 1),
     )
-    dataset = PuzzleDataset(dataset_cfg, split=split)
+    base_dataset = PuzzleDataset(dataset_cfg, split=split)
+    
+    # Wrap with FewShotDataset if enabled and training
+    if config.use_few_shot and split == "train" and vector_db is not None and meta_model is not None and base_model is not None:
+        dataset = FewShotDataset(
+            base_dataset=base_dataset,
+            vector_db=vector_db,
+            meta_model=meta_model,
+            base_model=base_model,
+            num_similar_examples=config.num_similar_examples,
+            device=config.device,
+            grid_height=config.grid_height,
+            grid_width=config.grid_width,
+        )
+    else:
+        dataset = base_dataset
+    
     dataloader = DataLoader(
         dataset,
         batch_size=None,
@@ -127,65 +162,18 @@ def create_meta_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMeta
         model: nn.Module = model_cls(model_cfg)
         print(f"Meta model: {model}")
         
-        # Load checkpoint if specified (handled in init_meta_train_state)
-        # This is just for the model creation, actual loading happens later
+        # Load checkpoint if specified
+        if config.load_checkpoint is not None:
+            print(f"Loading meta model checkpoint from {config.load_checkpoint}")
+            state_dict = torch.load(config.load_checkpoint, map_location=config.device)
+            model.load_state_dict(state_dict, strict=False)
     
     return model
 
 
 def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata):
     """Load pretrained base TRM model."""
-    import os
-    import yaml
-    
-    # Try to load config from checkpoint directory if it exists
-    # First, find where the checkpoint file actually is
-    checkpoint_path = config.base_checkpoint_path
-    actual_checkpoint_file = None
-    
-    # Try to locate the checkpoint file
-    if os.path.exists(checkpoint_path):
-        actual_checkpoint_file = checkpoint_path
-    elif os.path.exists(os.path.join("checkpoints", checkpoint_path)):
-        actual_checkpoint_file = os.path.join("checkpoints", checkpoint_path)
-    else:
-        # Search in checkpoints subdirectories
-        if os.path.exists("checkpoints"):
-            for root, dirs, files in os.walk("checkpoints"):
-                if checkpoint_path in files or os.path.basename(checkpoint_path) in files:
-                    actual_checkpoint_file = os.path.join(root, checkpoint_path if checkpoint_path in files else os.path.basename(checkpoint_path))
-                    break
-    
-    # Find config in the same directory as checkpoint
-    checkpoint_config_path = None
-    if actual_checkpoint_file:
-        checkpoint_dir = os.path.dirname(actual_checkpoint_file)
-        config_path = os.path.join(checkpoint_dir, "all_config.yaml")
-        if os.path.exists(config_path):
-            checkpoint_config_path = config_path
-    
-    base_arch_cfg = dict(config.base_arch)  # Default to config.base_arch
-    
-    if os.path.exists(checkpoint_config_path):
-        print(f"Loading checkpoint config from {checkpoint_config_path}")
-        try:
-            with open(checkpoint_config_path, "rt") as f:
-                checkpoint_config = yaml.safe_load(f)
-            
-            # Extract arch config from checkpoint
-            if "arch" in checkpoint_config:
-                checkpoint_arch = checkpoint_config["arch"]
-                # Use checkpoint's arch config, but allow overrides from meta_train.yaml
-                print(f"Found checkpoint config with arch: {checkpoint_arch.get('name', 'unknown')}")
-                # Merge: checkpoint config as base, but allow meta_train.yaml to override
-                base_arch_cfg = {**checkpoint_arch, **config.base_arch}
-                print(f"Using merged arch config: {base_arch_cfg}")
-        except Exception as e:
-            print(f"Warning: Could not load checkpoint config ({e}), using meta_train.yaml base_arch")
-    else:
-        print(f"Checkpoint config not found at {checkpoint_config_path}, using meta_train.yaml base_arch")
-    
-    # Remove reserved keys that will be set from metadata
+    base_arch_cfg = dict(config.base_arch)
     for reserved_key in ("batch_size", "vocab_size", "seq_len", "num_puzzle_identifiers", "causal"):
         base_arch_cfg.pop(reserved_key, None)
     
@@ -223,7 +211,7 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
     return base_model
 
 
-def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata, load_checkpoint_path: Optional[str] = None):
+def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata):
     """Initialize meta training state."""
     # Estimated total training steps
     total_steps = int(config.meta_epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
@@ -240,34 +228,11 @@ def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDataset
         betas=(config.meta_beta1, config.meta_beta2)
     )
     
-    # Initialize state
-    baseline_reward = 0.0
-    step = 0
-    
-    # Load checkpoint if specified
-    if load_checkpoint_path is not None and os.path.exists(load_checkpoint_path):
-        print(f"Loading meta model checkpoint from {load_checkpoint_path}")
-        checkpoint_data = torch.load(load_checkpoint_path, map_location=config.device)
-        
-        # Load model
-        if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
-            # New format with training state
-            meta_model.load_state_dict(checkpoint_data["model_state_dict"], strict=False)
-            meta_optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
-            step = checkpoint_data.get("step", 0)
-            baseline_reward = checkpoint_data.get("baseline_reward", 0.0)
-            total_steps = checkpoint_data.get("total_steps", total_steps)
-            print(f"Resumed from step {step}, baseline_reward={baseline_reward:.4f}")
-        else:
-            # Old format (just state_dict)
-            meta_model.load_state_dict(checkpoint_data, strict=False)
-            print("Loaded model weights (old format, training state not restored)")
-    
     return MetaTrainState(
         meta_model=meta_model,
         meta_optimizer=meta_optimizer,
-        baseline_reward=baseline_reward,
-        step=step,
+        baseline_reward=0.0,
+        step=0,
         total_steps=total_steps,
     )
 
@@ -339,10 +304,22 @@ def train_meta_batch(
     train_batch = {k: v.to(config.device) for k, v in train_batch.items()}
     val_batch = {k: v.to(config.device) for k, v in val_batch.items()}
     
+    # Handle few-shot batches: extract original puzzles for MetaTRM pattern sampling
+    if config.use_few_shot and "similar_inputs" in train_batch:
+        # Few-shot mode: use original puzzles for MetaTRM pattern sampling
+        # The similar examples are already augmented and will be used during reward computation
+        meta_batch = {
+            "inputs": train_batch["inputs"],
+            "labels": train_batch["labels"],
+            "puzzle_identifiers": train_batch["puzzle_identifiers"],
+        }
+    else:
+        meta_batch = train_batch
+    
     # 1. Sample augmentation patterns from meta model
     patterns, log_probs = sample_patterns_from_meta_model(
         meta_model=train_state.meta_model,
-        batch=train_batch,
+        batch=meta_batch,
         num_patterns=config.num_patterns_per_batch,
         temperature=1.0,
     )
@@ -352,6 +329,25 @@ def train_meta_batch(
     pattern_log_probs = log_probs.sum(dim=-1)  # [num_patterns]
     
     # 2. Compute rewards for each pattern
+    # In few-shot mode, pass similar examples for fine-tuning
+    few_shot_train_batch = None
+    if config.use_few_shot and "similar_inputs" in train_batch:
+        # Extract similar examples for fine-tuning
+        similar_inputs = train_batch["similar_inputs"]  # [batch_size, num_similar, seq_len]
+        similar_labels = train_batch["similar_labels"]  # [batch_size, num_similar, seq_len]
+        batch_size = similar_inputs.shape[0]
+        num_similar = similar_inputs.shape[1]
+        
+        # Flatten similar examples for training
+        similar_inputs_flat = similar_inputs.view(-1, similar_inputs.shape[-1])
+        similar_labels_flat = similar_labels.view(-1, similar_labels.shape[-1])
+        
+        few_shot_train_batch = {
+            "inputs": similar_inputs_flat,
+            "labels": similar_labels_flat,
+            "puzzle_identifiers": train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0),
+        }
+    
     (
         rewards,
         baseline_loss,
@@ -366,6 +362,10 @@ def train_meta_batch(
         use_binary_reward=config.use_binary_reward,
         reward_scale=config.reward_scale,
         loss_type=config.loss_type,
+        grid_height=config.grid_height,
+        grid_width=config.grid_width,
+        few_shot_train_batch=few_shot_train_batch,
+        meta_model=train_state.meta_model if config.use_few_shot else None,
     )
     
     # rewards: List[float], e.g., [0.0, 1.0, 0.0]
@@ -430,18 +430,11 @@ def train_meta_batch(
         "meta/mean_reward": mean_reward,
         "meta/baseline_reward": train_state.baseline_reward,
         "meta/baseline_loss": baseline_loss,
+        "meta/rewards": rewards,  # List of rewards
         "meta/step": train_state.step,
+        **trm_baseline_metrics,
+        **trm_post_metrics,
     }
-    
-    # Add TRM baseline metrics (filter out None values - W&B ignores them)
-    for key, value in trm_baseline_metrics.items():
-        if value is not None:
-            metrics[key] = value
-    
-    # Add TRM post metrics (filter out None values - W&B ignores them)
-    for key, value in trm_post_metrics.items():
-        if value is not None:
-            metrics[key] = value
     
     return metrics
 
@@ -453,39 +446,8 @@ def save_checkpoint(config: MetaTrainConfig, train_state: MetaTrainState):
     
     os.makedirs(config.checkpoint_path, exist_ok=True)
     checkpoint_file = os.path.join(config.checkpoint_path, f"meta_step_{train_state.step}.pt")
-    
-    # Save model state dict and training state
-    checkpoint_data = {
-        "model_state_dict": train_state.meta_model.state_dict(),
-        "optimizer_state_dict": train_state.meta_optimizer.state_dict(),
-        "step": train_state.step,
-        "baseline_reward": train_state.baseline_reward,
-        "total_steps": train_state.total_steps,
-    }
-    torch.save(checkpoint_data, checkpoint_file)
+    torch.save(train_state.meta_model.state_dict(), checkpoint_file)
     print(f"Saved checkpoint to {checkpoint_file}")
-
-
-def find_latest_checkpoint(checkpoint_dir: str) -> Optional[Tuple[str, int]]:
-    """Find the latest checkpoint file and its step number."""
-    if not os.path.exists(checkpoint_dir):
-        return None
-    
-    import re
-    latest_step = -1
-    latest_file = None
-    
-    for filename in os.listdir(checkpoint_dir):
-        match = re.match(r"meta_step_(\d+)\.pt", filename)
-        if match:
-            step = int(match.group(1))
-            if step > latest_step:
-                latest_step = step
-                latest_file = os.path.join(checkpoint_dir, filename)
-    
-    if latest_file:
-        return latest_file, latest_step
-    return None
 
 
 def load_synced_config(hydra_config: DictConfig) -> MetaTrainConfig:
@@ -499,14 +461,6 @@ def load_synced_config(hydra_config: DictConfig) -> MetaTrainConfig:
         config.run_name = f"meta-{coolname.generate_slug(2)}"
     if config.checkpoint_path is None:
         config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
-    
-    # Auto-resume: if load_checkpoint not specified but checkpoint directory exists, find latest
-    if config.load_checkpoint is None and os.path.exists(config.checkpoint_path):
-        latest = find_latest_checkpoint(config.checkpoint_path)
-        if latest:
-            checkpoint_file, step = latest
-            config.load_checkpoint = checkpoint_file
-            print(f"Auto-resuming from latest checkpoint: {checkpoint_file} (step {step})")
     
     return config
 
@@ -523,9 +477,55 @@ def launch(hydra_config: DictConfig):
     device = torch.device(config.device)
     print(f"Using device: {device}")
     
-    # Dataset
-    train_loader, train_metadata = create_dataloader(
-        config, "train", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size
+    # Load vector database and setup few-shot if enabled
+    vector_db = None
+    meta_model_for_fewshot = None
+    
+    if config.use_few_shot:
+        if config.vector_db_path and os.path.exists(config.vector_db_path):
+            print(f"Loading vector database from {config.vector_db_path}")
+            vector_db = PuzzleVectorDB.load(config.vector_db_path)
+            print(f"Loaded vector database with {len(vector_db)} puzzles")
+        else:
+            raise ValueError(f"Vector database not found at {config.vector_db_path}. Please build it first using utils/build_vector_db.py")
+    
+    # Create base dataset first to get metadata
+    base_train_dataset = PuzzleDataset(PuzzleDatasetConfig(
+        seed=config.seed,
+        dataset_paths=config.data_paths,
+        global_batch_size=config.global_batch_size,
+        test_set_mode=False,
+        epochs_per_iter=1,
+        rank=0,
+        num_replicas=1,
+    ), split="train")
+    train_metadata = base_train_dataset.metadata
+    
+    # Initialize training state (MetaTRM)
+    train_state = init_meta_train_state(config, train_metadata)
+    
+    # Load base model
+    base_model = load_base_model(config, train_metadata)
+    base_model = base_model.to(device)
+    
+    # Extract base TRM model for few-shot (unwrap from loss head if needed)
+    base_model_for_fewshot = base_model
+    
+    # Use the MetaTRM being trained for few-shot augmentation selection
+    if config.use_few_shot:
+        meta_model_for_fewshot = train_state.meta_model
+    
+    # Create dataloaders (with few-shot wrapper if enabled)
+    train_loader, _ = create_dataloader(
+        config,
+        "train",
+        rank=0,
+        num_replicas=1,
+        epochs_per_iter=1,
+        global_batch_size=config.global_batch_size,
+        vector_db=vector_db,
+        meta_model=meta_model_for_fewshot,
+        base_model=base_model_for_fewshot,
     )
     
     val_loader = None
@@ -540,13 +540,6 @@ def launch(hydra_config: DictConfig):
             val_loader, val_metadata = train_loader, train_metadata
     else:
         val_loader, val_metadata = train_loader, train_metadata
-    
-    # Initialize training state (with auto-resume if checkpoint found)
-    train_state = init_meta_train_state(config, train_metadata, load_checkpoint_path=config.load_checkpoint)
-    
-    # Load base model
-    base_model = load_base_model(config, train_metadata)
-    base_model = base_model.to(device)
     
     # Progress bar and logger
     progress_bar = tqdm.tqdm(total=train_state.total_steps)

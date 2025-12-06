@@ -41,3 +41,28 @@ max_eval_batches: 10 # Limit number of evaluation batches (None = no limit, set 
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+
+# Few-shot training (SEAL-style)
+use_few_shot: False # Enable few-shot training with vector database
+num_similar_examples: 3 # Number of similar examples to fetch per puzzle
+vector_db_path: null # Path to vector database file (required if use_few_shot=True)
+rebuild_vector_db: False # Force rebuild vector database
+meta_trm_config: null # MetaTRM architecture config (required if use_few_shot=True)
+  # Example:
+  #   name: recursive_reasoning.metaTRM@MetaTRM
+  #   H_cycles: 2
+  #   L_cycles: 2
+  #   L_layers: 2
+  #   hidden_size: 64
+  #   num_heads: 2
+  #   expansion: 4
+  #   pos_encodings: rope
+  #   forward_dtype: bfloat16
+  #   mlp_t: False
+  #   puzzle_emb_ndim: 64
+  #   puzzle_emb_len: 16
+  #   aug_slots: 6
+  #   choices_per_slot: 2
+meta_trm_checkpoint: null # Path to MetaTRM checkpoint (optional)
+grid_height: 9 # Height of grid for augmentation
+grid_width: 9 # Width of grid for augmentation
