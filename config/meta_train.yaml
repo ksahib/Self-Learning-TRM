@@ -93,3 +93,7 @@ meta_trm_checkpoint: null  # MetaTRM checkpoint (optional, uses training MetaTRM
 grid_height: 9  # Height of grid for augmentation
 grid_width: 9  # Width of grid for augmentation
 
+# Eval-only mode (run evaluation without training)
+eval_only: False  # If True, run evaluation only (no training updates)
+eval_num_batches: 100  # Number of batches to evaluate over for stable metrics (used when eval_only=True)
+

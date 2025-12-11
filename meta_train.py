@@ -87,6 +87,10 @@ class MetaTrainConfig(BaseModel):
     meta_trm_checkpoint: Optional[str] = None
     grid_height: int = 9
     grid_width: int = 9
+    
+    # Eval-only mode
+    eval_only: bool = False
+    eval_num_batches: int = 100  # Number of batches to evaluate over for stable metrics
 
 
 @dataclass
@@ -475,6 +479,178 @@ def save_checkpoint(config: MetaTrainConfig, train_state: MetaTrainState):
     print(f"Saved checkpoint to {checkpoint_file}")
 
 
+def evaluate_meta(
+    config: MetaTrainConfig,
+    train_state: MetaTrainState,
+    base_model: TinyRecursiveReasoningModel_ACTV1,
+    eval_loader: DataLoader,
+    num_batches: int = 100,
+) -> Dict[str, float]:
+    """
+    Evaluate MetaTRM without training (eval-only mode).
+    
+    Runs inference over multiple batches and aggregates metrics for stable evaluation.
+    Similar to evaluate() in pretrain.py but for meta-training setup.
+    
+    Args:
+        config: MetaTrainConfig
+        train_state: MetaTrainState (meta model will be set to eval mode)
+        base_model: Base TRM model
+        eval_loader: DataLoader for evaluation batches
+        num_batches: Number of batches to evaluate over
+    
+    Returns:
+        Dictionary of aggregated metrics
+    """
+    train_state.meta_model.eval()
+    base_model.eval()
+    
+    all_baseline_metrics = []
+    all_pattern_metrics = []
+    all_rewards = []
+    all_baseline_losses = []
+    
+    eval_batch_count = 0
+    val_iter = iter(eval_loader)
+    
+    print(f"Running evaluation over {num_batches} batches...")
+    
+    with torch.inference_mode():
+        while eval_batch_count < num_batches:
+            try:
+                _, val_batch, _ = next(val_iter)
+            except StopIteration:
+                # Reset iterator if we run out
+                val_iter = iter(eval_loader)
+                _, val_batch, _ = next(val_iter)
+            
+            # Move to device
+            val_batch = {k: v.to(config.device) for k, v in val_batch.items()}
+            
+            # For eval-only mode:
+            # - If few-shot is enabled, eval_loader contains train batches with few-shot data
+            # - Otherwise, eval_loader contains val batches
+            # We use the batch as both train and val batch for evaluation
+            train_batch = val_batch
+            
+            # Handle few-shot batches if needed
+            if config.use_few_shot and "similar_inputs" in train_batch:
+                meta_batch = {
+                    "inputs": train_batch["inputs"],
+                    "labels": train_batch["labels"],
+                    "puzzle_identifiers": train_batch["puzzle_identifiers"],
+                }
+            else:
+                meta_batch = train_batch
+            
+            # Sample patterns from meta model
+            patterns, log_probs = sample_patterns_from_meta_model(
+                meta_model=train_state.meta_model,
+                batch=meta_batch,
+                num_patterns=config.num_patterns_per_batch,
+                temperature=1.0,
+            )
+            
+            # Prepare few-shot batch if needed
+            few_shot_train_batch = None
+            if config.use_few_shot and "similar_inputs" in train_batch:
+                similar_inputs = train_batch["similar_inputs"]
+                similar_labels = train_batch["similar_labels"]
+                batch_size = similar_inputs.shape[0]
+                num_similar = similar_inputs.shape[1]
+                
+                if num_similar > 0 and similar_inputs.numel() > 0:
+                    similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])
+                    similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])
+                    
+                    if "similar_puzzle_identifiers" in train_batch:
+                        similar_puzzle_ids_flat = train_batch["similar_puzzle_identifiers"].reshape(-1)
+                    else:
+                        similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
+                    
+                    max_puzzle_id = base_model.config.num_puzzle_identifiers - 1
+                    if similar_puzzle_ids_flat.min() >= 0 and similar_puzzle_ids_flat.max() <= max_puzzle_id:
+                        few_shot_train_batch = {
+                            "inputs": similar_inputs_flat,
+                            "labels": similar_labels_flat,
+                            "puzzle_identifiers": similar_puzzle_ids_flat,
+                        }
+            
+            # Compute rewards (this evaluates but doesn't update meta model)
+            rewards, baseline_loss, baseline_metrics, pattern_metrics = compute_rewards_from_augmentations(
+                base_model=base_model,
+                original_batch=val_batch,
+                patterns=patterns,
+                num_finetune_steps=config.num_finetune_steps,
+                baseline_loss=None,
+                use_binary_reward=config.use_binary_reward,
+                reward_scale=config.reward_scale,
+                loss_type=config.loss_type,
+                grid_height=config.grid_height,
+                grid_width=config.grid_width,
+                few_shot_train_batch=few_shot_train_batch,
+                meta_model=train_state.meta_model if config.use_few_shot else None,
+            )
+            
+            # Collect metrics
+            all_baseline_metrics.append(baseline_metrics)
+            all_pattern_metrics.extend(pattern_metrics)
+            all_rewards.extend(rewards)
+            all_baseline_losses.append(baseline_loss)
+            
+            eval_batch_count += 1
+            
+            if eval_batch_count % 10 == 0:
+                print(f"  Evaluated {eval_batch_count}/{num_batches} batches...")
+    
+    # Aggregate metrics
+    def aggregate_metrics(metrics_list, key):
+        """Aggregate a metric across all batches."""
+        values = [m[key] for m in metrics_list if m.get(key) is not None]
+        if len(values) == 0:
+            return None
+        return float(sum(values) / len(values))
+    
+    # Aggregate baseline metrics
+    trm_metric_keys = [
+        "loss",
+        "accuracy",
+        "exact_accuracy",
+        "q_halt_accuracy",
+        "lm_loss",
+        "q_halt_loss",
+        "q_continue_loss",
+        "steps",
+    ]
+    
+    aggregated_baseline = {}
+    for key in trm_metric_keys:
+        val = aggregate_metrics(all_baseline_metrics, key)
+        if val is not None:
+            aggregated_baseline[f"trm_eval/baseline/{key}"] = val
+    
+    # Aggregate post-augmentation metrics
+    aggregated_post = {}
+    for key in trm_metric_keys:
+        values = [m.get(key) for m in all_pattern_metrics if m.get(key) is not None]
+        if len(values) > 0:
+            aggregated_post[f"trm_eval/post/{key}_mean"] = float(sum(values) / len(values))
+    
+    # Aggregate rewards
+    mean_reward = float(sum(all_rewards) / len(all_rewards)) if len(all_rewards) > 0 else 0.0
+    mean_baseline_loss = float(sum(all_baseline_losses) / len(all_baseline_losses)) if len(all_baseline_losses) > 0 else 0.0
+    
+    metrics = {
+        "eval/mean_reward": mean_reward,
+        "eval/baseline_loss": mean_baseline_loss,
+        "eval/num_batches": eval_batch_count,
+        **aggregated_baseline,
+        **aggregated_post,
+    }
+    
+    return metrics
+
+
 def load_synced_config(hydra_config: DictConfig) -> MetaTrainConfig:
     """Load and process config."""
     config = MetaTrainConfig(**hydra_config)  # type: ignore
@@ -577,6 +753,58 @@ def launch(hydra_config: DictConfig):
         settings=wandb.Settings(_disable_stats=True)
     )
     wandb.log({"num_meta_params": sum(x.numel() for x in train_state.meta_model.parameters())}, step=0)
+    
+    # Eval-only mode: run evaluation without training
+    if config.eval_only:
+        print("="*60)
+        print("Running in EVAL-ONLY mode (no training)")
+        print("="*60)
+        
+        # For eval-only: use train_loader if few-shot is enabled (needs few-shot batches),
+        # otherwise use val_loader if available
+        eval_loader_for_eval = None
+        if config.use_few_shot:
+            print("Few-shot enabled: using train loader for evaluation (needs few-shot batches)")
+            eval_loader_for_eval = train_loader
+        elif val_loader is not None:
+            print("Using validation loader for evaluation")
+            eval_loader_for_eval = val_loader
+        else:
+            print("Warning: No validation loader available. Using train loader for evaluation.")
+            eval_loader_for_eval = train_loader
+        
+        eval_metrics = evaluate_meta(
+            config=config,
+            train_state=train_state,
+            base_model=base_model,
+            eval_loader=eval_loader_for_eval,
+            num_batches=config.eval_num_batches,
+        )
+        
+        # Print results
+        print("\n" + "="*60)
+        print("EVAL-ONLY RESULTS (averaged over batches)")
+        print("="*60)
+        print(f"Mean reward: {eval_metrics.get('eval/mean_reward', 0.0):.4f}")
+        print(f"Baseline loss: {eval_metrics.get('eval/baseline_loss', 0.0):.4f}")
+        print(f"Number of batches evaluated: {eval_metrics.get('eval/num_batches', 0)}")
+        print("\nBaseline Metrics:")
+        for key in ["loss", "accuracy", "exact_accuracy", "q_halt_accuracy"]:
+            full_key = f"trm_eval/baseline/{key}"
+            if full_key in eval_metrics:
+                print(f"  {key}: {eval_metrics[full_key]:.4f}")
+        print("\nPost-Augmentation Metrics (mean):")
+        for key in ["loss", "accuracy", "exact_accuracy"]:
+            full_key = f"trm_eval/post/{key}_mean"
+            if full_key in eval_metrics:
+                print(f"  {key}: {eval_metrics[full_key]:.4f}")
+        print("="*60)
+        
+        # Log to wandb
+        wandb.log(eval_metrics, step=0)
+        wandb.finish()
+        print("\nEval-only completed!")
+        return
     
     # Training Loop
     print(f"Starting meta training for {config.meta_epochs} epochs...")
