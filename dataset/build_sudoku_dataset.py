@@ -20,6 +20,7 @@ class DataProcessConfig(BaseModel):
     output_dir: str = "data/sudoku-extreme-full"
 
     subsample_size: Optional[int] = None
+    subsample_size_test: Optional[int] = None
     min_difficulty: Optional[int] = None
     num_aug: int = 0
 
@@ -72,12 +73,17 @@ def convert_subset(set_name: str, config: DataProcessConfig):
                 inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
                 labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
 
-    # If subsample_size is specified for the training set,
-    # randomly sample the desired number of examples.
-    if config.subsample_size is not None:
+    # Subsampling: different logic for train vs test
+    if set_name == "train" and config.subsample_size is not None:
         total_samples = len(inputs)
         if config.subsample_size < total_samples:
             indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
+            inputs = [inputs[i] for i in indices]
+            labels = [labels[i] for i in indices]
+    elif set_name == "test" and config.subsample_size_test is not None:
+        total_samples = len(inputs)
+        if config.subsample_size_test < total_samples:
+            indices = np.random.choice(total_samples, size=config.subsample_size_test, replace=False)
             inputs = [inputs[i] for i in indices]
             labels = [labels[i] for i in indices]
 
