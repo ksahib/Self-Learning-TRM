@@ -40,7 +40,8 @@ base_checkpoint_path: "step_21700"  # Path to pretrained base TRM checkpoint
 
 # Data paths
 data_paths: ['data/arc-aug-1000']  # Training data
-data_paths_val: []  # Validation data (empty = use training data)
+data_paths_val: []  # Validation data (empty = use test if provided, else training)
+data_paths_test: []  # Test data (used when data_paths_val is empty)
 
 # Hyperparameters
 global_batch_size: 32

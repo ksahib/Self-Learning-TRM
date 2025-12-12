@@ -40,6 +40,7 @@ class MetaTrainConfig(BaseModel):
     # Data
     data_paths: List[str]
     data_paths_val: List[str] = []
+    data_paths_test: List[str] = []
     
     # Hyperparams
     global_batch_size: int
@@ -110,9 +111,12 @@ def create_dataloader(
     base_model: Optional[TinyRecursiveReasoningModel_ACTV1] = None,
     **kwargs
 ):
-    dataset_paths = (
-        config.data_paths_val if split == "val" and len(config.data_paths_val) > 0 else config.data_paths
-    )
+    if split == "val" and len(config.data_paths_val) > 0:
+        dataset_paths = config.data_paths_val
+    elif split != "train" and len(config.data_paths_test) > 0:
+        dataset_paths = config.data_paths_test
+    else:
+        dataset_paths = config.data_paths
     dataset_cfg = PuzzleDatasetConfig(
         seed=config.seed,
         dataset_paths=dataset_paths,
@@ -739,8 +743,19 @@ def launch(hydra_config: DictConfig):
         except:
             print("Warning: Could not create validation loader, using train data for validation")
             val_loader, val_metadata = train_loader, train_metadata
+    elif len(config.data_paths_test) > 0:
+        try:
+            val_loader, val_metadata = create_dataloader(
+                config, "test", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size
+            )
+        except:
+            print("Warning: Could not create test loader, using train data for validation")
+            val_loader, val_metadata = train_loader, train_metadata
     else:
         val_loader, val_metadata = train_loader, train_metadata
+    
+    # Eval loader choice: prefer val, else test (handled above), else train
+    eval_loader_for_eval = val_loader if val_loader is not None else train_loader
     
     # Progress bar and logger
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
@@ -836,9 +851,8 @@ def launch(hydra_config: DictConfig):
             # Keep track of last metrics for epoch-end logging
             epoch_metrics = metrics
             
-            # Log metrics (log every step, or at eval_interval)
-            if train_state.step % config.eval_interval == 0 or train_state.step == 1:
-                wandb.log(metrics, step=train_state.step)
+            # Log metrics every step
+            wandb.log(metrics, step=train_state.step)
             
             # Update progress bar every step
             progress_bar.update(1)
@@ -846,18 +860,22 @@ def launch(hydra_config: DictConfig):
             # Checkpoint
             if train_state.step % config.checkpoint_interval == 0:
                 save_checkpoint(config, train_state)
-            
-            # Evaluation
-            if train_state.step % config.eval_interval == 0 and train_state.step > 0:
-                print(f"\nStep {train_state.step}: Mean reward = {metrics['meta/mean_reward']:.4f}, Baseline = {metrics['meta/baseline_reward']:.4f}")
-                if 'trm_eval/baseline/accuracy' in metrics and metrics['trm_eval/baseline/accuracy'] is not None:
-                    print(f"  TRM Baseline Accuracy: {metrics['trm_eval/baseline/accuracy']:.4f}")
-                if 'trm_eval/post/accuracy_mean' in metrics and metrics['trm_eval/post/accuracy_mean'] is not None:
-                    print(f"  TRM Post-Aug Accuracy: {metrics['trm_eval/post/accuracy_mean']:.4f}")
         
         # Log metrics at end of epoch (if we have any)
         if epoch_metrics is not None:
             wandb.log(epoch_metrics, step=train_state.step)
+        
+        # Periodic full evaluation (like pretrain: every eval_interval epochs)
+        if (epoch + 1) % config.eval_interval == 0:
+            print(f"\nEVALUATE at epoch {epoch + 1}")
+            eval_metrics = evaluate_meta(
+                config=config,
+                train_state=train_state,
+                base_model=base_model,
+                eval_loader=eval_loader_for_eval,
+                num_batches=config.eval_num_batches,
+            )
+            wandb.log(eval_metrics, step=train_state.step)
         
         # Epoch checkpoint
         save_checkpoint(config, train_state)
