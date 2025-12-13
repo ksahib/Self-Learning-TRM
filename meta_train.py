@@ -390,7 +390,7 @@ def train_meta_batch(
         pattern_metrics,
     ) = compute_rewards_from_augmentations(
         base_model=base_model,
-        original_batch=val_batch,  
+        original_batch=meta_batch,  # Use same input for baseline and evaluation (matches pattern sampling)
         patterns=patterns,
         num_finetune_steps=config.num_finetune_steps,
         baseline_loss=None,  # Will compute automatically
@@ -607,7 +607,7 @@ def evaluate_meta(
         finetune_start = time.time()
         rewards, baseline_loss, baseline_metrics, pattern_metrics = compute_rewards_from_augmentations(
             base_model=base_model,
-            original_batch=val_batch,
+            original_batch=meta_batch,  # Use same input for baseline and evaluation (matches pattern sampling)
             patterns=patterns,
             num_finetune_steps=config.num_finetune_steps,
             baseline_loss=None,
