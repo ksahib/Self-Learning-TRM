@@ -722,7 +722,7 @@ def compute_rewards_from_augmentations(
         if len(lora_params) == 0:
             raise ValueError("No LoRA parameters found in model. Make sure model uses LoRACastedLinear layers.")
         
-        optimizer = torch.optim.Adam(lora_params, lr=2e-5)
+        optimizer = torch.optim.Adam(lora_params, lr=1e-7)
         
         for _ in range(num_finetune_steps):
             carry = base_model.initial_carry(aug_batch)
@@ -764,4 +764,5 @@ def compute_rewards_from_augmentations(
     base_model.load_state_dict(original_state)
     
     return rewards, baseline_loss, baseline_metrics, pattern_eval_metrics
+
 
