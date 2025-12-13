@@ -639,6 +639,43 @@ def evaluate_meta(
         print(f"  Batch {eval_batch_count}/{num_batches} completed in {batch_total_time:.3f}s "
               f"(meta: {meta_sample_time:.3f}s, finetune: {finetune_time:.3f}s)")
         
+        # DIAGNOSTIC: Print baseline and per-pattern metrics
+        baseline_acc = baseline_metrics.get("exact_accuracy", 0.0)
+        baseline_loss_val = baseline_loss
+        
+        print(f"    Baseline: acc={baseline_acc:.4f}, loss={baseline_loss_val:.4f}")
+        
+        # Analyze each pattern's performance
+        improved_patterns = []
+        worsened_patterns = []
+        for i, (pattern, pattern_metric) in enumerate(zip(patterns, pattern_metrics)):
+            pattern_acc = pattern_metric.get("exact_accuracy", 0.0)
+            pattern_loss = pattern_metric.get("loss", float('inf'))
+            reward_val = rewards[i] if i < len(rewards) else 0.0
+            improvement = pattern_acc - baseline_acc
+            loss_improvement = baseline_loss_val - pattern_loss  # Positive means loss decreased (better)
+            
+            status = "✓" if improvement > 0 else "✗"
+            print(f"    Pattern {i+1} [{pattern}]: acc={pattern_acc:.4f} ({improvement:+.4f}), "
+                  f"loss={pattern_loss:.4f} ({loss_improvement:+.4f}), reward={reward_val:.2f} {status}")
+            
+            if improvement > 0:
+                improved_patterns.append((pattern, improvement, pattern_acc))
+            elif improvement < 0:
+                worsened_patterns.append((pattern, improvement, pattern_acc))
+        
+        # Summary
+        if improved_patterns:
+            print(f"    ✓ Improved patterns ({len(improved_patterns)}): {[p[0] for p in improved_patterns]}")
+        if worsened_patterns:
+            print(f"    ✗ Worsened patterns ({len(worsened_patterns)}): {[p[0] for p in worsened_patterns]}")
+        
+        # Compute mean post-augmentation accuracy
+        post_accs = [pm.get("exact_accuracy", 0.0) for pm in pattern_metrics]
+        mean_post_acc = sum(post_accs) / len(post_accs) if len(post_accs) > 0 else 0.0
+        overall_improvement = mean_post_acc - baseline_acc
+        print(f"    Overall: mean_post_acc={mean_post_acc:.4f}, improvement={overall_improvement:+.4f}")
+        
         # Log per-batch metrics to wandb (step = batch_index, 0-indexed)
         batch_step = eval_batch_count - 1
         batch_metrics = {
