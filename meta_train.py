@@ -2,6 +2,7 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 import os
 import math
+import time
 import yaml
 import copy
 
@@ -504,7 +505,14 @@ def evaluate_meta(
         num_batches: Number of batches to evaluate over
     
     Returns:
-        Dictionary of aggregated metrics
+        Dictionary of aggregated metrics including:
+        - eval/mean_reward: Mean reward across all batches
+        - eval/baseline_loss: Mean baseline loss
+        - eval/mean_meta_sample_time: Average time to sample patterns from meta model (seconds)
+        - eval/mean_finetune_time: Average time for fine-tuning + evaluation (seconds)
+        - eval/mean_total_time_per_batch: Average total time per batch (seconds)
+        - trm_eval/baseline/*: Baseline TRM metrics
+        - trm_eval/post/*_mean: Post-augmentation TRM metrics
     """
     train_state.meta_model.eval()
     base_model.eval()
@@ -513,6 +521,11 @@ def evaluate_meta(
     all_pattern_metrics = []
     all_rewards = []
     all_baseline_losses = []
+    
+    # Timing metrics
+    all_meta_sample_times = []
+    all_finetune_times = []
+    all_total_times = []
     
     eval_batch_count = 0
     val_iter = iter(eval_loader)
@@ -523,6 +536,7 @@ def evaluate_meta(
     # needs to fine-tune the base model, which requires gradients. We only disable gradients
     # for meta model sampling.
     while eval_batch_count < num_batches:
+        batch_start_time = time.time()
         try:
             _, val_batch, _ = next(val_iter)
         except StopIteration:
@@ -550,6 +564,7 @@ def evaluate_meta(
             meta_batch = train_batch
         
         # Sample patterns from meta model (no gradients needed for meta model)
+        meta_sample_start = time.time()
         with torch.no_grad():
             patterns, log_probs = sample_patterns_from_meta_model(
                 meta_model=train_state.meta_model,
@@ -557,6 +572,10 @@ def evaluate_meta(
                 num_patterns=config.num_patterns_per_batch,
                 temperature=1.0,
             )
+        if config.device == "cuda":
+            torch.cuda.synchronize()  # Ensure GPU operations complete
+        meta_sample_time = time.time() - meta_sample_start
+        all_meta_sample_times.append(meta_sample_time)
         
         # Prepare few-shot batch if needed
         few_shot_train_batch = None
@@ -584,6 +603,7 @@ def evaluate_meta(
                     }
         
         # Compute rewards (this fine-tunes base model, needs gradients enabled!)
+        finetune_start = time.time()
         rewards, baseline_loss, baseline_metrics, pattern_metrics = compute_rewards_from_augmentations(
             base_model=base_model,
             original_batch=val_batch,
@@ -598,6 +618,10 @@ def evaluate_meta(
             few_shot_train_batch=few_shot_train_batch,
             meta_model=train_state.meta_model if config.use_few_shot else None,
         )
+        if config.device == "cuda":
+            torch.cuda.synchronize()  # Ensure GPU operations complete
+        finetune_time = time.time() - finetune_start
+        all_finetune_times.append(finetune_time)
         
         # Collect metrics
         all_baseline_metrics.append(baseline_metrics)
@@ -605,10 +629,18 @@ def evaluate_meta(
         all_rewards.extend(rewards)
         all_baseline_losses.append(baseline_loss)
         
+        batch_total_time = time.time() - batch_start_time
+        all_total_times.append(batch_total_time)
+        
         eval_batch_count += 1
         
+        # Print timing for each batch (similar to TRM's "Completed inference in X steps")
+        print(f"  Batch {eval_batch_count}/{num_batches} completed in {batch_total_time:.3f}s "
+              f"(meta: {meta_sample_time:.3f}s, finetune: {finetune_time:.3f}s)")
+        
         if eval_batch_count % 10 == 0:
-            print(f"  Evaluated {eval_batch_count}/{num_batches} batches...")
+            avg_time = sum(all_total_times[-10:]) / min(10, len(all_total_times))
+            print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
     
     # Aggregate metrics
     def aggregate_metrics(metrics_list, key):
@@ -647,10 +679,18 @@ def evaluate_meta(
     mean_reward = float(sum(all_rewards) / len(all_rewards)) if len(all_rewards) > 0 else 0.0
     mean_baseline_loss = float(sum(all_baseline_losses) / len(all_baseline_losses)) if len(all_baseline_losses) > 0 else 0.0
     
+    # Aggregate timing metrics
+    mean_meta_sample_time = float(sum(all_meta_sample_times) / len(all_meta_sample_times)) if len(all_meta_sample_times) > 0 else 0.0
+    mean_finetune_time = float(sum(all_finetune_times) / len(all_finetune_times)) if len(all_finetune_times) > 0 else 0.0
+    mean_total_time = float(sum(all_total_times) / len(all_total_times)) if len(all_total_times) > 0 else 0.0
+    
     metrics = {
         "eval/mean_reward": mean_reward,
         "eval/baseline_loss": mean_baseline_loss,
         "eval/num_batches": eval_batch_count,
+        "eval/mean_meta_sample_time": mean_meta_sample_time,
+        "eval/mean_finetune_time": mean_finetune_time,
+        "eval/mean_total_time_per_batch": mean_total_time,
         **aggregated_baseline,
         **aggregated_post,
     }
