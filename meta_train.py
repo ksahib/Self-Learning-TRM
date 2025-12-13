@@ -531,6 +531,57 @@ def evaluate_meta(
     eval_batch_count = 0
     val_iter = iter(eval_loader)
     
+    # Initialize metrics buffer for aggregation (reset for each evaluation run)
+    metrics_buffer = []
+    log_interval = 10  # Aggregate every 10 batches before logging to wandb
+    
+    # Define aggregation function (needed for both wandb logging and final aggregation)
+    def aggregate_metrics_with_count(metrics_list, key, count_key="count"):
+        """
+        Aggregate metrics by accumulating counts (like pretrain.py).
+        For exact_accuracy and similar ratio metrics, convert back to counts, sum, then normalize.
+        """
+        if len(metrics_list) == 0:
+            return None
+        
+        # Special handling for ratio metrics that should be aggregated by count
+        ratio_metrics = {"exact_accuracy", "accuracy", "q_halt_accuracy"}
+        
+        if key in ratio_metrics:
+            # For ratio metrics: convert to counts, sum, then normalize
+            total_numerator = 0.0
+            total_denominator = 0.0
+            
+            for m in metrics_list:
+                if key in m and count_key in m:
+                    ratio = m[key]
+                    count = m[count_key]
+                    if ratio is not None and count is not None and count > 0:
+                        # Convert ratio back to count of correct items
+                        numerator = ratio * count
+                        total_numerator += numerator
+                        total_denominator += count
+            
+            if total_denominator > 0:
+                return float(total_numerator / total_denominator)
+            return None
+        else:
+            # For other metrics (loss, steps, etc.), use weighted average by count
+            total_weighted_sum = 0.0
+            total_weight = 0.0
+            
+            for m in metrics_list:
+                if key in m and count_key in m:
+                    value = m[key]
+                    count = m[count_key]
+                    if value is not None and count is not None and count > 0:
+                        total_weighted_sum += value * count
+                        total_weight += count
+            
+            if total_weight > 0:
+                return float(total_weighted_sum / total_weight)
+            return None
+    
     print(f"Running evaluation over {num_batches} batches...")
     
     # Note: We don't use torch.inference_mode() here because compute_rewards_from_augmentations
@@ -676,51 +727,85 @@ def evaluate_meta(
         overall_improvement = mean_post_acc - baseline_acc
         print(f"    Overall: mean_post_acc={mean_post_acc:.4f}, improvement={overall_improvement:+.4f}")
         
-        # Log per-batch metrics to wandb (step = batch_index, 0-indexed)
-        batch_step = eval_batch_count - 1
-        batch_metrics = {
-            "eval/batch_reward": float(sum(rewards) / len(rewards)) if len(rewards) > 0 else 0.0,
-            "eval/batch_baseline_loss": float(baseline_loss),
-            "eval/batch_meta_sample_time": meta_sample_time,
-            "eval/batch_finetune_time": finetune_time,
-            "eval/batch_total_time": batch_total_time,
+        # Store metrics in buffer for aggregation (don't log every batch)
+        batch_metrics_buffer = {
+            "baseline_metrics": baseline_metrics,  # Has "count" field
+            "pattern_metrics": pattern_metrics,     # List of dicts, each has "count"
+            "rewards": rewards,
+            "baseline_loss": baseline_loss,
+            "meta_sample_time": meta_sample_time,
+            "finetune_time": finetune_time,
+            "total_time": batch_total_time,
         }
+        metrics_buffer.append(batch_metrics_buffer)
         
-        # Add baseline metrics for this batch
-        for key, value in baseline_metrics.items():
-            if value is not None:
-                if isinstance(value, torch.Tensor):
-                    value = float(value.item())
-                elif isinstance(value, (int, float)):
-                    value = float(value)
-                else:
-                    continue  # Skip non-numeric values
-                batch_metrics[f"trm_eval/baseline/{key}"] = value
-        
-        # Add post-augmentation metrics (mean across patterns for this batch)
-        if len(pattern_metrics) > 0:
-            # Get all keys from pattern metrics
-            pattern_keys = set()
-            for pm in pattern_metrics:
-                pattern_keys.update(pm.keys())
+        # Log to wandb every log_interval batches (aggregated)
+        if eval_batch_count % log_interval == 0 and len(metrics_buffer) > 0:
+            # Aggregate metrics from buffer using count-weighted method
+            buffer_baseline = [m["baseline_metrics"] for m in metrics_buffer]
+            buffer_patterns = []
+            for m in metrics_buffer:
+                buffer_patterns.extend(m["pattern_metrics"])
             
-            # Aggregate each metric across patterns
-            for key in pattern_keys:
-                values = [pm.get(key) for pm in pattern_metrics if pm.get(key) is not None]
-                if len(values) > 0:
-                    # Convert to float if needed
-                    float_values = []
-                    for v in values:
-                        if isinstance(v, torch.Tensor):
-                            float_values.append(float(v.item()))
-                        elif isinstance(v, (int, float)):
-                            float_values.append(float(v))
-                    
-                    if len(float_values) > 0:
-                        mean_val = sum(float_values) / len(float_values)
-                        batch_metrics[f"trm_eval/post/{key}_mean"] = mean_val
-        
-        wandb.log(batch_metrics, step=batch_step)
+            # Define metric keys (same as used in final aggregation)
+            trm_metric_keys = [
+                "loss",
+                "accuracy",
+                "exact_accuracy",
+                "q_halt_accuracy",
+                "lm_loss",
+                "q_halt_loss",
+                "q_continue_loss",
+                "steps",
+            ]
+            
+            # Aggregate baseline metrics
+            aggregated_baseline = {}
+            for key in trm_metric_keys:
+                val = aggregate_metrics_with_count(buffer_baseline, key)
+                if val is not None:
+                    aggregated_baseline[f"trm_eval/baseline/{key}"] = val
+            
+            # Aggregate post-augmentation metrics
+            aggregated_post = {}
+            for key in trm_metric_keys:
+                val = aggregate_metrics_with_count(buffer_patterns, key)
+                if val is not None:
+                    aggregated_post[f"trm_eval/post/{key}_mean"] = val
+            
+            # Aggregate other metrics
+            buffer_rewards = []
+            buffer_baseline_losses = []
+            buffer_meta_times = []
+            buffer_finetune_times = []
+            buffer_total_times = []
+            
+            for m in metrics_buffer:
+                buffer_rewards.extend(m["rewards"])
+                buffer_baseline_losses.append(m["baseline_loss"])
+                buffer_meta_times.append(m["meta_sample_time"])
+                buffer_finetune_times.append(m["finetune_time"])
+                buffer_total_times.append(m["total_time"])
+            
+            # Log aggregated metrics to wandb
+            wandb_step = (eval_batch_count // log_interval) - 1  # 0-indexed
+            wandb_metrics = {
+                "eval/aggregated_reward": float(sum(buffer_rewards) / len(buffer_rewards)) if len(buffer_rewards) > 0 else 0.0,
+                "eval/aggregated_baseline_loss": float(sum(buffer_baseline_losses) / len(buffer_baseline_losses)) if len(buffer_baseline_losses) > 0 else 0.0,
+                "eval/aggregated_meta_sample_time": float(sum(buffer_meta_times) / len(buffer_meta_times)) if len(buffer_meta_times) > 0 else 0.0,
+                "eval/aggregated_finetune_time": float(sum(buffer_finetune_times) / len(buffer_finetune_times)) if len(buffer_finetune_times) > 0 else 0.0,
+                "eval/aggregated_total_time": float(sum(buffer_total_times) / len(buffer_total_times)) if len(buffer_total_times) > 0 else 0.0,
+                "eval/batches_in_window": len(metrics_buffer),
+                **aggregated_baseline,
+                **aggregated_post,
+            }
+            
+            wandb.log(wandb_metrics, step=wandb_step)
+            
+            # Clear buffer
+            metrics_buffer = []
+            
+            print(f"  Logged aggregated metrics to wandb (batches {eval_batch_count - log_interval + 1}-{eval_batch_count})")
         
         # Print intermediate stats every 20 batches
         if eval_batch_count % 20 == 0:
@@ -735,6 +820,66 @@ def evaluate_meta(
             avg_time = sum(all_total_times[-10:]) / min(10, len(all_total_times))
             print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
     
+    # Flush remaining metrics in buffer (if any)
+    if len(metrics_buffer) > 0:
+        # Aggregate metrics from remaining buffer
+        buffer_baseline = [m["baseline_metrics"] for m in metrics_buffer]
+        buffer_patterns = []
+        for m in metrics_buffer:
+            buffer_patterns.extend(m["pattern_metrics"])
+        
+        trm_metric_keys = [
+            "loss",
+            "accuracy",
+            "exact_accuracy",
+            "q_halt_accuracy",
+            "lm_loss",
+            "q_halt_loss",
+            "q_continue_loss",
+            "steps",
+        ]
+        
+        aggregated_baseline = {}
+        for key in trm_metric_keys:
+            val = aggregate_metrics_with_count(buffer_baseline, key)
+            if val is not None:
+                aggregated_baseline[f"trm_eval/baseline/{key}"] = val
+        
+        aggregated_post = {}
+        for key in trm_metric_keys:
+            val = aggregate_metrics_with_count(buffer_patterns, key)
+            if val is not None:
+                aggregated_post[f"trm_eval/post/{key}_mean"] = val
+        
+        buffer_rewards = []
+        buffer_baseline_losses = []
+        buffer_meta_times = []
+        buffer_finetune_times = []
+        buffer_total_times = []
+        
+        for m in metrics_buffer:
+            buffer_rewards.extend(m["rewards"])
+            buffer_baseline_losses.append(m["baseline_loss"])
+            buffer_meta_times.append(m["meta_sample_time"])
+            buffer_finetune_times.append(m["finetune_time"])
+            buffer_total_times.append(m["total_time"])
+        
+        # Log remaining aggregated metrics to wandb
+        wandb_step = eval_batch_count // log_interval  # Next step after last full window
+        wandb_metrics = {
+            "eval/aggregated_reward": float(sum(buffer_rewards) / len(buffer_rewards)) if len(buffer_rewards) > 0 else 0.0,
+            "eval/aggregated_baseline_loss": float(sum(buffer_baseline_losses) / len(buffer_baseline_losses)) if len(buffer_baseline_losses) > 0 else 0.0,
+            "eval/aggregated_meta_sample_time": float(sum(buffer_meta_times) / len(buffer_meta_times)) if len(buffer_meta_times) > 0 else 0.0,
+            "eval/aggregated_finetune_time": float(sum(buffer_finetune_times) / len(buffer_finetune_times)) if len(buffer_finetune_times) > 0 else 0.0,
+            "eval/aggregated_total_time": float(sum(buffer_total_times) / len(buffer_total_times)) if len(buffer_total_times) > 0 else 0.0,
+            "eval/batches_in_window": len(metrics_buffer),
+            **aggregated_baseline,
+            **aggregated_post,
+        }
+        
+        wandb.log(wandb_metrics, step=wandb_step)
+        print(f"  Logged remaining aggregated metrics to wandb (batches {eval_batch_count - len(metrics_buffer) + 1}-{eval_batch_count})")
+    
     # Aggregate metrics like pretrain.py: accumulate counts, then normalize
     # This gives stable metrics instead of averaging volatile per-batch ratios.
     # 
@@ -744,52 +889,6 @@ def evaluate_meta(
     #
     # This matches pretrain.py's evaluate() function which accumulates metrics
     # across all batches before normalizing, resulting in smooth growth curves.
-    
-    def aggregate_metrics_with_count(metrics_list, key, count_key="count"):
-        """
-        Aggregate metrics by accumulating counts (like pretrain.py).
-        For exact_accuracy and similar ratio metrics, convert back to counts, sum, then normalize.
-        """
-        if len(metrics_list) == 0:
-            return None
-        
-        # Special handling for ratio metrics that should be aggregated by count
-        ratio_metrics = {"exact_accuracy", "accuracy", "q_halt_accuracy"}
-        
-        if key in ratio_metrics:
-            # For ratio metrics: convert to counts, sum, then normalize
-            total_numerator = 0.0
-            total_denominator = 0.0
-            
-            for m in metrics_list:
-                if key in m and count_key in m:
-                    ratio = m[key]
-                    count = m[count_key]
-                    if ratio is not None and count is not None and count > 0:
-                        # Convert ratio back to count of correct items
-                        numerator = ratio * count
-                        total_numerator += numerator
-                        total_denominator += count
-            
-            if total_denominator > 0:
-                return float(total_numerator / total_denominator)
-            return None
-        else:
-            # For other metrics (loss, steps, etc.), use weighted average by count
-            total_weighted_sum = 0.0
-            total_weight = 0.0
-            
-            for m in metrics_list:
-                if key in m and count_key in m:
-                    value = m[key]
-                    count = m[count_key]
-                    if value is not None and count is not None and count > 0:
-                        total_weighted_sum += value * count
-                        total_weight += count
-            
-            if total_weight > 0:
-                return float(total_weighted_sum / total_weight)
-            return None
     
     # Aggregate baseline metrics
     trm_metric_keys = [
