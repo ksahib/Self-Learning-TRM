@@ -519,93 +519,96 @@ def evaluate_meta(
     
     print(f"Running evaluation over {num_batches} batches...")
     
-    with torch.inference_mode():
-        while eval_batch_count < num_batches:
-            try:
-                _, val_batch, _ = next(val_iter)
-            except StopIteration:
-                # Reset iterator if we run out
-                val_iter = iter(eval_loader)
-                _, val_batch, _ = next(val_iter)
-            
-            # Move to device
-            val_batch = {k: v.to(config.device) for k, v in val_batch.items()}
-            
-            # For eval-only mode:
-            # - If few-shot is enabled, eval_loader contains train batches with few-shot data
-            # - Otherwise, eval_loader contains val batches
-            # We use the batch as both train and val batch for evaluation
-            train_batch = val_batch
-            
-            # Handle few-shot batches if needed
-            if config.use_few_shot and "similar_inputs" in train_batch:
-                meta_batch = {
-                    "inputs": train_batch["inputs"],
-                    "labels": train_batch["labels"],
-                    "puzzle_identifiers": train_batch["puzzle_identifiers"],
-                }
-            else:
-                meta_batch = train_batch
-            
-            # Sample patterns from meta model
+    # Note: We don't use torch.inference_mode() here because compute_rewards_from_augmentations
+    # needs to fine-tune the base model, which requires gradients. We only disable gradients
+    # for meta model sampling.
+    while eval_batch_count < num_batches:
+        try:
+            _, val_batch, _ = next(val_iter)
+        except StopIteration:
+            # Reset iterator if we run out
+            val_iter = iter(eval_loader)
+            _, val_batch, _ = next(val_iter)
+        
+        # Move to device
+        val_batch = {k: v.to(config.device) for k, v in val_batch.items()}
+        
+        # For eval-only mode:
+        # - If few-shot is enabled, eval_loader contains train batches with few-shot data
+        # - Otherwise, eval_loader contains val batches
+        # We use the batch as both train and val batch for evaluation
+        train_batch = val_batch
+        
+        # Handle few-shot batches if needed
+        if config.use_few_shot and "similar_inputs" in train_batch:
+            meta_batch = {
+                "inputs": train_batch["inputs"],
+                "labels": train_batch["labels"],
+                "puzzle_identifiers": train_batch["puzzle_identifiers"],
+            }
+        else:
+            meta_batch = train_batch
+        
+        # Sample patterns from meta model (no gradients needed for meta model)
+        with torch.no_grad():
             patterns, log_probs = sample_patterns_from_meta_model(
                 meta_model=train_state.meta_model,
                 batch=meta_batch,
                 num_patterns=config.num_patterns_per_batch,
                 temperature=1.0,
             )
+        
+        # Prepare few-shot batch if needed
+        few_shot_train_batch = None
+        if config.use_few_shot and "similar_inputs" in train_batch:
+            similar_inputs = train_batch["similar_inputs"]
+            similar_labels = train_batch["similar_labels"]
+            batch_size = similar_inputs.shape[0]
+            num_similar = similar_inputs.shape[1]
             
-            # Prepare few-shot batch if needed
-            few_shot_train_batch = None
-            if config.use_few_shot and "similar_inputs" in train_batch:
-                similar_inputs = train_batch["similar_inputs"]
-                similar_labels = train_batch["similar_labels"]
-                batch_size = similar_inputs.shape[0]
-                num_similar = similar_inputs.shape[1]
+            if num_similar > 0 and similar_inputs.numel() > 0:
+                similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])
+                similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])
                 
-                if num_similar > 0 and similar_inputs.numel() > 0:
-                    similar_inputs_flat = similar_inputs.reshape(-1, similar_inputs.shape[-1])
-                    similar_labels_flat = similar_labels.reshape(-1, similar_labels.shape[-1])
-                    
-                    if "similar_puzzle_identifiers" in train_batch:
-                        similar_puzzle_ids_flat = train_batch["similar_puzzle_identifiers"].reshape(-1)
-                    else:
-                        similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
-                    
-                    max_puzzle_id = base_model.config.num_puzzle_identifiers - 1
-                    if similar_puzzle_ids_flat.min() >= 0 and similar_puzzle_ids_flat.max() <= max_puzzle_id:
-                        few_shot_train_batch = {
-                            "inputs": similar_inputs_flat,
-                            "labels": similar_labels_flat,
-                            "puzzle_identifiers": similar_puzzle_ids_flat,
-                        }
-            
-            # Compute rewards (this evaluates but doesn't update meta model)
-            rewards, baseline_loss, baseline_metrics, pattern_metrics = compute_rewards_from_augmentations(
-                base_model=base_model,
-                original_batch=val_batch,
-                patterns=patterns,
-                num_finetune_steps=config.num_finetune_steps,
-                baseline_loss=None,
-                use_binary_reward=config.use_binary_reward,
-                reward_scale=config.reward_scale,
-                loss_type=config.loss_type,
-                grid_height=config.grid_height,
-                grid_width=config.grid_width,
-                few_shot_train_batch=few_shot_train_batch,
-                meta_model=train_state.meta_model if config.use_few_shot else None,
-            )
-            
-            # Collect metrics
-            all_baseline_metrics.append(baseline_metrics)
-            all_pattern_metrics.extend(pattern_metrics)
-            all_rewards.extend(rewards)
-            all_baseline_losses.append(baseline_loss)
-            
-            eval_batch_count += 1
-            
-            if eval_batch_count % 10 == 0:
-                print(f"  Evaluated {eval_batch_count}/{num_batches} batches...")
+                if "similar_puzzle_identifiers" in train_batch:
+                    similar_puzzle_ids_flat = train_batch["similar_puzzle_identifiers"].reshape(-1)
+                else:
+                    similar_puzzle_ids_flat = train_batch["puzzle_identifiers"].repeat_interleave(num_similar, dim=0)
+                
+                max_puzzle_id = base_model.config.num_puzzle_identifiers - 1
+                if similar_puzzle_ids_flat.min() >= 0 and similar_puzzle_ids_flat.max() <= max_puzzle_id:
+                    few_shot_train_batch = {
+                        "inputs": similar_inputs_flat,
+                        "labels": similar_labels_flat,
+                        "puzzle_identifiers": similar_puzzle_ids_flat,
+                    }
+        
+        # Compute rewards (this fine-tunes base model, needs gradients enabled!)
+        rewards, baseline_loss, baseline_metrics, pattern_metrics = compute_rewards_from_augmentations(
+            base_model=base_model,
+            original_batch=val_batch,
+            patterns=patterns,
+            num_finetune_steps=config.num_finetune_steps,
+            baseline_loss=None,
+            use_binary_reward=config.use_binary_reward,
+            reward_scale=config.reward_scale,
+            loss_type=config.loss_type,
+            grid_height=config.grid_height,
+            grid_width=config.grid_width,
+            few_shot_train_batch=few_shot_train_batch,
+            meta_model=train_state.meta_model if config.use_few_shot else None,
+        )
+        
+        # Collect metrics
+        all_baseline_metrics.append(baseline_metrics)
+        all_pattern_metrics.extend(pattern_metrics)
+        all_rewards.extend(rewards)
+        all_baseline_losses.append(baseline_loss)
+        
+        eval_batch_count += 1
+        
+        if eval_batch_count % 10 == 0:
+            print(f"  Evaluated {eval_batch_count}/{num_batches} batches...")
     
     # Aggregate metrics
     def aggregate_metrics(metrics_list, key):
