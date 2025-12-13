@@ -638,7 +638,16 @@ def evaluate_meta(
         print(f"  Batch {eval_batch_count}/{num_batches} completed in {batch_total_time:.3f}s "
               f"(meta: {meta_sample_time:.3f}s, finetune: {finetune_time:.3f}s)")
         
-        if eval_batch_count % 10 == 0:
+        # Print intermediate stats every 20 batches
+        if eval_batch_count % 20 == 0:
+            current_mean_reward = sum(all_rewards) / len(all_rewards) if len(all_rewards) > 0 else 0.0
+            current_mean_loss = sum(all_baseline_losses) / len(all_baseline_losses) if len(all_baseline_losses) > 0 else 0.0
+            avg_time = sum(all_total_times[-20:]) / min(20, len(all_total_times))
+            print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
+            print(f"  Intermediate stats (after {eval_batch_count} batches):")
+            print(f"    Mean reward so far: {current_mean_reward:.4f}")
+            print(f"    Mean baseline loss: {current_mean_loss:.4f}")
+        elif eval_batch_count % 10 == 0:
             avg_time = sum(all_total_times[-10:]) / min(10, len(all_total_times))
             print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
     
