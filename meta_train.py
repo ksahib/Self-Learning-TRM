@@ -129,8 +129,9 @@ def create_dataloader(
     )
     base_dataset = PuzzleDataset(dataset_cfg, split=split)
     
-    # Wrap with FewShotDataset if enabled and training
-    if config.use_few_shot and split == "train" and vector_db is not None and meta_model is not None and base_model is not None:
+    # Wrap with FewShotDataset if enabled (for any split, not just train)
+    # This allows few-shot to work during evaluation on test/val data
+    if config.use_few_shot and vector_db is not None and meta_model is not None and base_model is not None:
         dataset = FewShotDataset(
             base_dataset=base_dataset,
             vector_db=vector_db,
@@ -147,7 +148,7 @@ def create_dataloader(
     # Use num_workers=0 when using few-shot dataset to avoid CUDA initialization issues in worker processes
     # Few-shot dataset needs to run models (base_model, meta_model) which requires CUDA
     # CUDA cannot be initialized in forked worker processes
-    use_workers = 0 if config.use_few_shot and split == "train" else 1
+    use_workers = 0 if config.use_few_shot and vector_db is not None and meta_model is not None and base_model is not None else 1
     
     dataloader = DataLoader(
         dataset,
@@ -836,7 +837,10 @@ def launch(hydra_config: DictConfig):
     if len(config.data_paths_val) > 0:
         try:
             val_loader, val_metadata = create_dataloader(
-                config, "val", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size
+                config, "val", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size,
+                vector_db=vector_db if config.use_few_shot else None,
+                meta_model=meta_model_for_fewshot if config.use_few_shot else None,
+                base_model=base_model_for_fewshot if config.use_few_shot else None,
             )
         except:
             print("Warning: Could not create validation loader, using train data for validation")
@@ -844,7 +848,10 @@ def launch(hydra_config: DictConfig):
     elif len(config.data_paths_test) > 0:
         try:
             val_loader, val_metadata = create_dataloader(
-                config, "test", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size
+                config, "test", rank=0, num_replicas=1, epochs_per_iter=1, global_batch_size=config.global_batch_size,
+                vector_db=vector_db if config.use_few_shot else None,
+                meta_model=meta_model_for_fewshot if config.use_few_shot else None,
+                base_model=base_model_for_fewshot if config.use_few_shot else None,
             )
         except:
             print("Warning: Could not create test loader, using train data for validation")
@@ -873,17 +880,20 @@ def launch(hydra_config: DictConfig):
         print("Running in EVAL-ONLY mode (no training)")
         print("="*60)
         
-        # For eval-only: use train_loader if few-shot is enabled (needs few-shot batches),
-        # otherwise use val_loader if available
+        # For eval-only: prioritize val_loader (test data) even when few-shot is enabled
+        # Few-shot now works on test/val splits too, so we can use test data for proper evaluation
         eval_loader_for_eval = None
-        if config.use_few_shot:
-            print("Few-shot enabled: using train loader for evaluation (needs few-shot batches)")
-            eval_loader_for_eval = train_loader
-        elif val_loader is not None:
-            print("Using validation loader for evaluation")
+        if val_loader is not None:
+            if config.use_few_shot:
+                print("Few-shot enabled: using test/validation loader for evaluation (with few-shot support)")
+            else:
+                print("Using validation loader for evaluation")
             eval_loader_for_eval = val_loader
         else:
-            print("Warning: No validation loader available. Using train loader for evaluation.")
+            if config.use_few_shot:
+                print("Warning: No validation/test loader available. Using train loader for evaluation (with few-shot support).")
+            else:
+                print("Warning: No validation loader available. Using train loader for evaluation.")
             eval_loader_for_eval = train_loader
         
         eval_metrics = evaluate_meta(
