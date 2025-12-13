@@ -735,13 +735,61 @@ def evaluate_meta(
             avg_time = sum(all_total_times[-10:]) / min(10, len(all_total_times))
             print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
     
-    # Aggregate metrics
-    def aggregate_metrics(metrics_list, key):
-        """Aggregate a metric across all batches."""
-        values = [m[key] for m in metrics_list if m.get(key) is not None]
-        if len(values) == 0:
+    # Aggregate metrics like pretrain.py: accumulate counts, then normalize
+    # This gives stable metrics instead of averaging volatile per-batch ratios.
+    # 
+    # Key difference:
+    # - OLD (volatile): exact_accuracy = mean([batch1_acc, batch2_acc, ...])
+    # - NEW (stable): exact_accuracy = sum(correct_sequences) / sum(total_sequences)
+    #
+    # This matches pretrain.py's evaluate() function which accumulates metrics
+    # across all batches before normalizing, resulting in smooth growth curves.
+    
+    def aggregate_metrics_with_count(metrics_list, key, count_key="count"):
+        """
+        Aggregate metrics by accumulating counts (like pretrain.py).
+        For exact_accuracy and similar ratio metrics, convert back to counts, sum, then normalize.
+        """
+        if len(metrics_list) == 0:
             return None
-        return float(sum(values) / len(values))
+        
+        # Special handling for ratio metrics that should be aggregated by count
+        ratio_metrics = {"exact_accuracy", "accuracy", "q_halt_accuracy"}
+        
+        if key in ratio_metrics:
+            # For ratio metrics: convert to counts, sum, then normalize
+            total_numerator = 0.0
+            total_denominator = 0.0
+            
+            for m in metrics_list:
+                if key in m and count_key in m:
+                    ratio = m[key]
+                    count = m[count_key]
+                    if ratio is not None and count is not None and count > 0:
+                        # Convert ratio back to count of correct items
+                        numerator = ratio * count
+                        total_numerator += numerator
+                        total_denominator += count
+            
+            if total_denominator > 0:
+                return float(total_numerator / total_denominator)
+            return None
+        else:
+            # For other metrics (loss, steps, etc.), use weighted average by count
+            total_weighted_sum = 0.0
+            total_weight = 0.0
+            
+            for m in metrics_list:
+                if key in m and count_key in m:
+                    value = m[key]
+                    count = m[count_key]
+                    if value is not None and count is not None and count > 0:
+                        total_weighted_sum += value * count
+                        total_weight += count
+            
+            if total_weight > 0:
+                return float(total_weighted_sum / total_weight)
+            return None
     
     # Aggregate baseline metrics
     trm_metric_keys = [
@@ -757,16 +805,16 @@ def evaluate_meta(
     
     aggregated_baseline = {}
     for key in trm_metric_keys:
-        val = aggregate_metrics(all_baseline_metrics, key)
+        val = aggregate_metrics_with_count(all_baseline_metrics, key)
         if val is not None:
             aggregated_baseline[f"trm_eval/baseline/{key}"] = val
     
-    # Aggregate post-augmentation metrics
+    # Aggregate post-augmentation metrics (same approach)
     aggregated_post = {}
     for key in trm_metric_keys:
-        values = [m.get(key) for m in all_pattern_metrics if m.get(key) is not None]
-        if len(values) > 0:
-            aggregated_post[f"trm_eval/post/{key}_mean"] = float(sum(values) / len(values))
+        val = aggregate_metrics_with_count(all_pattern_metrics, key)
+        if val is not None:
+            aggregated_post[f"trm_eval/post/{key}_mean"] = val
     
     # Aggregate rewards
     mean_reward = float(sum(all_rewards) / len(all_rewards)) if len(all_rewards) > 0 else 0.0
