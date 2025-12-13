@@ -638,6 +638,52 @@ def evaluate_meta(
         print(f"  Batch {eval_batch_count}/{num_batches} completed in {batch_total_time:.3f}s "
               f"(meta: {meta_sample_time:.3f}s, finetune: {finetune_time:.3f}s)")
         
+        # Log per-batch metrics to wandb (step = batch_index, 0-indexed)
+        batch_step = eval_batch_count - 1
+        batch_metrics = {
+            "eval/batch_reward": float(sum(rewards) / len(rewards)) if len(rewards) > 0 else 0.0,
+            "eval/batch_baseline_loss": float(baseline_loss),
+            "eval/batch_meta_sample_time": meta_sample_time,
+            "eval/batch_finetune_time": finetune_time,
+            "eval/batch_total_time": batch_total_time,
+        }
+        
+        # Add baseline metrics for this batch
+        for key, value in baseline_metrics.items():
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    value = float(value.item())
+                elif isinstance(value, (int, float)):
+                    value = float(value)
+                else:
+                    continue  # Skip non-numeric values
+                batch_metrics[f"trm_eval/baseline/{key}"] = value
+        
+        # Add post-augmentation metrics (mean across patterns for this batch)
+        if len(pattern_metrics) > 0:
+            # Get all keys from pattern metrics
+            pattern_keys = set()
+            for pm in pattern_metrics:
+                pattern_keys.update(pm.keys())
+            
+            # Aggregate each metric across patterns
+            for key in pattern_keys:
+                values = [pm.get(key) for pm in pattern_metrics if pm.get(key) is not None]
+                if len(values) > 0:
+                    # Convert to float if needed
+                    float_values = []
+                    for v in values:
+                        if isinstance(v, torch.Tensor):
+                            float_values.append(float(v.item()))
+                        elif isinstance(v, (int, float)):
+                            float_values.append(float(v))
+                    
+                    if len(float_values) > 0:
+                        mean_val = sum(float_values) / len(float_values)
+                        batch_metrics[f"trm_eval/post/{key}_mean"] = mean_val
+        
+        wandb.log(batch_metrics, step=batch_step)
+        
         # Print intermediate stats every 20 batches
         if eval_batch_count % 20 == 0:
             current_mean_reward = sum(all_rewards) / len(all_rewards) if len(all_rewards) > 0 else 0.0
