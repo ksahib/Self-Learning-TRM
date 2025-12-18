@@ -24,7 +24,7 @@ class CastedSparseEmbedding(nn.Module):
         self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
         # Local embedding IDs, not persistent
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
-
+        
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if not self.training:
             # Test mode, no gradient
@@ -32,10 +32,22 @@ class CastedSparseEmbedding(nn.Module):
             
         # Training mode, fill puzzle embedding from weights
         with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
-
-        return self.local_weights.to(self.cast_to)
+            # self.local_weights / self.local_ids are allocated with a *maximum*
+            # batch size (config.batch_size), but the actual runtime batch size
+            # can be smaller (e.g. after augmentations). Copy only into the
+            # active slice to avoid mismatched shapes like "32 vs 64".
+            batch = inputs.shape[0]
+            if batch > self.local_weights.shape[0]:
+                raise ValueError(
+                    f"CastedSparseEmbedding received batch size {batch} "
+                    f"larger than configured max batch size {self.local_weights.shape[0]}."
+                )
+            
+            self.local_weights[:batch].copy_(self.weights[inputs])
+            self.local_ids[:batch].copy_(inputs)
+        
+        # Only return the slice corresponding to the current batch.
+        return self.local_weights[:inputs.shape[0]].to(self.cast_to)
 
 
 class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
