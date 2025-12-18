@@ -202,9 +202,22 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
     for reserved_key in ("batch_size", "vocab_size", "seq_len", "num_puzzle_identifiers", "causal"):
         base_arch_cfg.pop(reserved_key, None)
     
+    # The base TRM uses CastedSparseEmbedding, which is configured with a fixed
+    # max batch size. During meta-training we may create augmented batches
+    # larger than the logical global_batch_size (e.g., one example per active
+    # augmentation symbol, or flattened few-shot examples). To avoid runtime
+    # errors like:
+    #   "CastedSparseEmbedding received batch size X larger than
+    #    configured max batch size Y",
+    # we configure the base model with an effective batch size large enough
+    # to cover both augmentation expansion and few-shot flattening.
+    max_aug_per_puzzle = 6  # PATTERN_LENGTH for augmentation patterns
+    max_few_shot = config.num_similar_examples if config.use_few_shot else 1
+    effective_batch_size = config.global_batch_size * max(max_aug_per_puzzle, max_few_shot)
+
     model_cfg = dict(
         **base_arch_cfg,
-        batch_size=config.global_batch_size,
+        batch_size=effective_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
