@@ -205,7 +205,13 @@ class MetaTRMInner(nn.Module):
         self.h_head = CastedLinear(
             self.config.hidden_size,
             len(self.config.h_cycle_choices),
-            b…
+            bias=False,
+        )
+        self.l_head = CastedLinear(
+            self.config.hidden_size,
+            len(self.config.l_cycle_choices),
+            bias=False,
+        )
 
     def _input_embeddings(self, inputs: torch.Tensor, puzzle_identifiers: Optional[torch.Tensor]):
         embedding = self.embed_tokens(inputs.to(torch.int32))
