@@ -77,6 +77,12 @@ class MetaTrainConfig(BaseModel):
     seed: int = 0
     checkpoint_interval: int = 100
     eval_interval: int = 10
+    # Logging cadence
+    # How often to log per-step training metrics (in meta steps). Set to 1 to log every step.
+    log_interval: int = 1
+    # In evaluate_meta, how many eval batches to aggregate per logged point.
+    # This controls how dense the eval curves are in W&B (e.g., 10 → log every 10 eval batches).
+    eval_log_step: int = 10
     device: str = "cuda"
     loss_type: str = "softmax_cross_entropy"
     
@@ -533,7 +539,9 @@ def evaluate_meta(
     
     # Initialize metrics buffer for aggregation (reset for each evaluation run)
     metrics_buffer = []
-    log_interval = 10  # Aggregate every 10 batches before logging to wandb
+    # Aggregate metrics every config.eval_log_step batches before logging to wandb.
+    # This controls how dense the eval curves are (similar to TRM's "every 10 steps").
+    log_interval = max(config.eval_log_step, 1)
     
     # Define aggregation function (needed for both wandb logging and final aggregation)
     def aggregate_metrics_with_count(metrics_list, key, count_key="count"):
@@ -819,7 +827,7 @@ def evaluate_meta(
         elif eval_batch_count % 10 == 0:
             avg_time = sum(all_total_times[-10:]) / min(10, len(all_total_times))
             print(f"  Progress: {eval_batch_count}/{num_batches} batches (avg time: {avg_time:.3f}s/batch)")
-    
+        
     # Flush remaining metrics in buffer (if any)
     if len(metrics_buffer) > 0:
         # Aggregate metrics from remaining buffer
@@ -1143,8 +1151,9 @@ def launch(hydra_config: DictConfig):
             # Keep track of last metrics for epoch-end logging
             epoch_metrics = metrics
             
-            # Log metrics every step
-            wandb.log(metrics, step=train_state.step)
+            # Log training metrics every config.log_interval steps to reduce noise in W&B
+            if train_state.step % max(config.log_interval, 1) == 0:
+                wandb.log(metrics, step=train_state.step)
             
             # Update progress bar every step
             progress_bar.update(1)
