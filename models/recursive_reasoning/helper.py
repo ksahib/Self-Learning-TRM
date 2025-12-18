@@ -8,6 +8,9 @@ import numpy as np
 from .augmentation import (
     POSITION_INDEX_TO_CHOICES,
     AUG_TYPE_TO_ID,
+    ALL_PATTERN_VALUES,
+    AUG_NONE,
+    apply_single_augmentation,
     apply_augmentation_sequence_to_whole_grid,
     flatten_grid_to_sequence,
     unflatten_sequence_to_grid,
@@ -121,9 +124,23 @@ def apply_augmentation_patterns_to_batch(
     """
     Apply augmentation patterns to a batch of puzzles.
     
-    Each puzzle in the batch is augmented with its corresponding pattern.
-    If there are more patterns than puzzles, patterns are cycled.
-    If there are fewer patterns than puzzles, the last pattern is repeated.
+    Updated semantics for meta-training:
+    - Previously: each pattern string was interpreted as a *sequence* of
+      augmentations applied to the same grid, yielding exactly one augmented
+      puzzle per original puzzle.
+    - Now: for each puzzle and its pattern, we create one augmented example
+      per active augmentation symbol in the pattern. For example, if the
+      pattern contains 'L', 'R', and 'T' (and the rest are '.'), we create
+      three augmented Sudokus:
+          L(original), R(original), T(original)
+      all starting from the original grid (no composition).
+    - If a pattern has no active augmentations (all '.'), no augmented
+      examples are produced for that puzzle.
+    
+    This means the returned batch can have:
+      - More examples than the original batch (if patterns have multiple
+        active symbols), or
+      - Zero examples (if all patterns are all '.').
     
     Args:
         batch: Dictionary with 'inputs', 'labels', and optionally other keys.
@@ -134,59 +151,122 @@ def apply_augmentation_patterns_to_batch(
         grid_width: Width of the grid (default 9 for Sudoku).
     
     Returns:
-        Augmented batch with same structure as input, where each puzzle
-        has been transformed according to its pattern.
+        Augmented batch with the same keys as input. For keys that were
+        batch-aligned with 'inputs' (same first dimension), their first
+        dimension is expanded to match the number of generated augmented
+        examples. Non batch-aligned keys are omitted if no examples are
+        produced.
     """
-    batch_size = batch["inputs"].shape[0]
     device = batch["inputs"].device
     dtype = batch["inputs"].dtype
+    batch_size = batch["inputs"].shape[0]
     
-    # Convert to numpy for augmentation
+    # Convert inputs/labels to numpy for grid operations
     inputs_np = batch["inputs"].cpu().numpy()
     labels_np = batch["labels"].cpu().numpy() if "labels" in batch else None
     
-    aug_inputs_list = []
-    aug_labels_list = []
+    aug_inputs_list: List[np.ndarray] = []
+    aug_labels_list: List[np.ndarray] = []
+    other_key_lists: Dict[str, List[np.ndarray]] = {}
+    
+    # Determine which keys are batch-aligned (same first dimension as inputs)
+    batch_aligned_keys: List[str] = []
+    for key, value in batch.items():
+        if key in ("inputs", "labels"):
+            continue
+        if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
+            batch_aligned_keys.append(key)
+            other_key_lists[key] = []
     
     for i in range(batch_size):
-        # Get pattern for this puzzle (cycle if needed)
         pattern = patterns[i % len(patterns)]
         
-        # Unflatten input grid
+        # Active augmentation characters: valid, non-no-op symbols
+        active_augs: List[str] = [
+            c for c in pattern
+            if (c in ALL_PATTERN_VALUES and c != AUG_NONE and c != ".")
+        ]
+        
+        if len(active_augs) == 0:
+            # Nothing to do for this puzzle/pattern
+            continue
+        
+        # Unflatten the original grids once
         input_grid = unflatten_sequence_to_grid(inputs_np[i], grid_height, grid_width)
+        label_grid = (
+            unflatten_sequence_to_grid(labels_np[i], grid_height, grid_width)
+            if labels_np is not None
+            else None
+        )
         
-        # Apply augmentation sequence to whole grid
-        aug_input_grid = apply_augmentation_sequence_to_whole_grid(input_grid, pattern)
+        # Create one augmented example per active augmentation symbol
+        for aug_char in active_augs:
+            aug_input_grid = apply_single_augmentation(input_grid, aug_char)
+            aug_input_sequence = flatten_grid_to_sequence(aug_input_grid)
+            aug_inputs_list.append(aug_input_sequence)
+            
+            if label_grid is not None:
+                aug_label_grid = apply_single_augmentation(label_grid, aug_char)
+                aug_label_sequence = flatten_grid_to_sequence(aug_label_grid)
+                aug_labels_list.append(aug_label_sequence)
+            
+            # Replicate batch-aligned metadata for this new example
+            for key in batch_aligned_keys:
+                value = batch[key]
+                value_np = value[i].cpu().numpy()
+                other_key_lists[key].append(value_np)
+    
+    # If no augmented examples were produced, return an "empty" batch
+    if len(aug_inputs_list) == 0:
+        seq_len = batch["inputs"].shape[1]
+        empty_inputs = torch.empty((0, seq_len), dtype=dtype, device=device)
+        aug_batch: Dict[str, torch.Tensor] = {"inputs": empty_inputs}
         
-        # Flatten back
-        aug_input_sequence = flatten_grid_to_sequence(aug_input_grid)
-        aug_inputs_list.append(aug_input_sequence)
-        
-        # Apply same augmentation to labels if present
         if labels_np is not None:
-            label_grid = unflatten_sequence_to_grid(labels_np[i], grid_height, grid_width)
-            aug_label_grid = apply_augmentation_sequence_to_whole_grid(label_grid, pattern)
-            aug_label_sequence = flatten_grid_to_sequence(aug_label_grid)
-            aug_labels_list.append(aug_label_sequence)
+            empty_labels = torch.empty(
+                (0, batch["labels"].shape[1]),
+                dtype=batch["labels"].dtype,
+                device=device,
+            )
+            aug_batch["labels"] = empty_labels
+        
+        for key in batch_aligned_keys:
+            value = batch[key]
+            example_shape = value.shape[1:]
+            empty_other = torch.empty(
+                (0,) + example_shape,
+                dtype=value.dtype,
+                device=device,
+            )
+            aug_batch[key] = empty_other
+        
+        return aug_batch
     
-    # Convert back to tensors
+    # Stack inputs/labels into tensors
     aug_inputs = torch.tensor(
-        np.stack(aug_inputs_list), dtype=dtype, device=device
+        np.stack(aug_inputs_list),
+        dtype=dtype,
+        device=device,
     )
+    aug_batch: Dict[str, torch.Tensor] = {"inputs": aug_inputs}
     
-    # Build augmented batch
-    aug_batch = {"inputs": aug_inputs}
-    
-    if labels_np is not None:
+    if labels_np is not None and len(aug_labels_list) > 0:
         aug_labels = torch.tensor(
-            np.stack(aug_labels_list), dtype=batch["labels"].dtype, device=device
+            np.stack(aug_labels_list),
+            dtype=batch["labels"].dtype,
+            device=device,
         )
         aug_batch["labels"] = aug_labels
     
-    # Copy other keys (like puzzle_identifiers) if present
-    for key in batch:
-        if key not in ("inputs", "labels"):
-            aug_batch[key] = batch[key]
+    # Stack other batch-aligned keys
+    for key in batch_aligned_keys:
+        values_np = np.stack(other_key_lists[key])
+        value = batch[key]
+        aug_batch[key] = torch.tensor(
+            values_np,
+            dtype=value.dtype,
+            device=device,
+        )
     
     return aug_batch
 
@@ -711,10 +791,21 @@ def compute_rewards_from_augmentations(
                 # The patterns are still sampled for consistency, but we use the pre-augmented similar examples
                 aug_batch = few_shot_train_batch
         else:
-            # Standard mode: apply augmentation to original batch
+            # Standard mode: apply augmentation to original batch.
+            # NOTE (NR): apply_augmentation_patterns_to_batch now returns one
+            # augmented example per active augmentation symbol in the pattern,
+            # starting from the original grid each time. If the pattern has no
+            # active symbols (all '.'), this returns an empty batch.
             aug_batch = apply_augmentation_patterns_to_batch(
                 original_batch, [pattern], grid_height=grid_height, grid_width=grid_width
             )
+        
+        # If we ended up with an empty augmented batch (no active augmentations),
+        # skip fine-tuning for this pattern and assign zero reward.
+        if aug_batch["inputs"].shape[0] == 0:
+            pattern_eval_metrics.append(baseline_metrics)
+            rewards.append(0.0)
+            continue
         
         # 3c. Fine-tune base TRM with LoRA on augmented data
         base_model.train()

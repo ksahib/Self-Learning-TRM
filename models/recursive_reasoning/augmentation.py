@@ -201,7 +201,18 @@ def apply_augmentation_sequence_to_whole_grid(
     """
     result = grid.copy()
     
-    # Apply each augmentation in sequence to the whole grid
+    # NOTE (NR): Original implementation applied all non-'.' augmentations
+    # sequentially to the SAME grid, effectively composing them:
+    #   result = a_k(... a_2(a_1(grid)) ...)
+    #
+    # For the TinyRecursiveModels meta-training setup, we keep this helper
+    # unchanged (it is still used in some places), but the *batch-level*
+    # augmentation logic has been updated in apply_augmentation_patterns_to_batch
+    # to optionally generate multiple augmented examples per pattern instead of
+    # composing all active ops into a single grid.
+    #
+    # Here we preserve the original behaviour for callers that still expect a
+    # single composed augmentation.
     for aug_char in aug_pattern:
         if aug_char in ALL_PATTERN_VALUES:
             result = apply_single_augmentation(result, aug_char)
