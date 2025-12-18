@@ -59,7 +59,10 @@ base_finetune_lr: 1e-4
 
 # Reward config
 reward_scale: 1.0
-use_binary_reward: True  # True = binary (1 if improved, 0 if not), False = continuous
+use_binary_reward: False  # True = binary (1 if improved, 0 if not), False = continuous
+hl_cost_lambda: 0.01   # Penalty strength for H/L compute cost
+hl_cost_alpha: 1.0     # Weight for H_cycles in cost
+hl_cost_beta: 1.0      # Weight for L_cycles in cost
 
 # REINFORCE config
 baseline_momentum: 0.9  # Moving average for reward baseline

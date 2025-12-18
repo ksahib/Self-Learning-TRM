@@ -59,6 +59,10 @@ class MetaTrainConfig(BaseModel):
     # Reward config
     reward_scale: float = 1.0
     use_binary_reward: bool = True
+    # Compute-aware H/L cost trade-off for continuous rewards
+    hl_cost_lambda: float = 0.01  # Penalty strength λ
+    hl_cost_alpha: float = 1.0    # Weight for H_cycles
+    hl_cost_beta: float = 1.0     # Weight for L_cycles
     
     # REINFORCE config
     baseline_momentum: float = 0.9
@@ -263,9 +267,9 @@ def sample_patterns_from_meta_model(
     batch: Dict[str, torch.Tensor],
     num_patterns: int,
     temperature: float = 1.0,
-) -> Tuple[List[str], torch.Tensor]:
+) -> Tuple[List[str], torch.Tensor, List[int], List[int], torch.Tensor]:
     """
-    Sample multiple augmentation patterns from meta model.
+    Sample multiple augmentation patterns and H/L cycle choices from the meta model.
     
     Args:
         meta_model: MetaTRM model
@@ -274,8 +278,13 @@ def sample_patterns_from_meta_model(
         temperature: Sampling temperature
     
     Returns:
-        patterns: List of pattern strings
-        log_probs: Tensor of log probabilities [num_patterns, slots]
+        patterns: List of pattern strings (length = num_patterns)
+        slot_log_probs: Tensor of per-slot log probabilities [num_patterns, slots]
+        h_values: List of chosen H_cycles (length = num_patterns)
+        l_values: List of chosen L_cycles (length = num_patterns)
+        total_log_probs: Tensor of total log probabilities per pattern
+            [num_patterns], equal to
+            slot_log_probs[i].sum() + h_log_prob[i] + l_log_prob[i]
     """
     # Run meta model forward pass
     meta_carry = meta_model.initial_carry(batch)
@@ -286,21 +295,40 @@ def sample_patterns_from_meta_model(
         temperature=temperature,
     )
     
-    # Get patterns and log probs from batch
+    # Get patterns, H/L values, and log probs from batch
     all_patterns = meta_outputs["sampled_patterns"]  # List[str], one per batch element
-    all_log_probs = meta_outputs["sampled_log_probs"]  # [batch, slots]
+    all_slot_log_probs = meta_outputs["sampled_log_probs"]  # [batch, slots]
+    all_h_values = meta_outputs["sampled_H_values"]  # [batch]
+    all_l_values = meta_outputs["sampled_L_values"]  # [batch]
+    all_h_log_probs = meta_outputs["sampled_H_log_probs"]  # [batch]
+    all_l_log_probs = meta_outputs["sampled_L_log_probs"]  # [batch]
     
     # Take first num_patterns patterns (or cycle if needed)
-    patterns = []
-    log_probs_list = []
+    patterns: List[str] = []
+    slot_log_probs_list: List[torch.Tensor] = []
+    h_values: List[int] = []
+    l_values: List[int] = []
+    total_log_probs_list: List[torch.Tensor] = []
+    num_available = max(len(all_patterns), 1)
+    
     for i in range(num_patterns):
-        idx = i % len(all_patterns)
+        idx = i % num_available
         patterns.append(all_patterns[idx])
-        log_probs_list.append(all_log_probs[idx])
+        slot_log_probs = all_slot_log_probs[idx]
+        h_val = int(all_h_values[idx].item())
+        l_val = int(all_l_values[idx].item())
+        h_lp = all_h_log_probs[idx]
+        l_lp = all_l_log_probs[idx]
+        
+        slot_log_probs_list.append(slot_log_probs)
+        h_values.append(h_val)
+        l_values.append(l_val)
+        total_log_probs_list.append(slot_log_probs.sum() + h_lp + l_lp)
     
-    log_probs = torch.stack(log_probs_list)  # [num_patterns, slots]
+    slot_log_probs_tensor = torch.stack(slot_log_probs_list)  # [num_patterns, slots]
+    total_log_probs_tensor = torch.stack(total_log_probs_list)  # [num_patterns]
     
-    return patterns, log_probs
+    return patterns, slot_log_probs_tensor, h_values, l_values, total_log_probs_tensor
 
 
 def train_meta_batch(
@@ -337,17 +365,19 @@ def train_meta_batch(
     else:
         meta_batch = train_batch
     
-    # 1. Sample augmentation patterns from meta model
-    patterns, log_probs = sample_patterns_from_meta_model(
+    # 1. Sample augmentation patterns and H/L cycles from meta model
+    (
+        patterns,
+        slot_log_probs,
+        h_values,
+        l_values,
+        pattern_log_probs,
+    ) = sample_patterns_from_meta_model(
         meta_model=train_state.meta_model,
         batch=meta_batch,
         num_patterns=config.num_patterns_per_batch,
         temperature=1.0,
     )
-    
-    # log_probs: [num_patterns, slots]
-    # Sum over slots to get total log prob per pattern
-    pattern_log_probs = log_probs.sum(dim=-1)  # [num_patterns]
     
     # 2. Compute rewards for each pattern
     # In few-shot mode, pass similar examples for fine-tuning
@@ -407,6 +437,11 @@ def train_meta_batch(
         grid_width=config.grid_width,
         few_shot_train_batch=few_shot_train_batch,
         meta_model=train_state.meta_model if config.use_few_shot else None,
+        h_cycles=h_values,
+        l_cycles=l_values,
+        hl_cost_lambda=config.hl_cost_lambda,
+        hl_cost_alpha=config.hl_cost_alpha,
+        hl_cost_beta=config.hl_cost_beta,
     )
     
     # rewards: List[float], e.g., [0.0, 1.0, 0.0]
@@ -426,9 +461,9 @@ def train_meta_batch(
     policy_loss = -(pattern_log_probs * advantages).mean()
     
     # 5. Entropy regularization (encourage exploration)
-    # Compute entropy from log_probs
-    probs = torch.exp(log_probs)  # [num_patterns, slots]
-    entropy = -(probs * log_probs).sum(dim=-1).mean()  # Average entropy over patterns
+    # Compute entropy from per-slot log_probs (augmentation choices only)
+    probs = torch.exp(slot_log_probs)  # [num_patterns, slots]
+    entropy = -(probs * slot_log_probs).sum(dim=-1).mean()  # Average entropy over patterns
     entropy_loss = -config.entropy_coefficient * entropy  # Negative because we want to maximize entropy
     
     total_loss = policy_loss + entropy_loss
@@ -626,7 +661,13 @@ def evaluate_meta(
         # Sample patterns from meta model (no gradients needed for meta model)
         meta_sample_start = time.time()
         with torch.no_grad():
-            patterns, log_probs = sample_patterns_from_meta_model(
+            (
+                patterns,
+                slot_log_probs,
+                h_values,
+                l_values,
+                pattern_log_probs,
+            ) = sample_patterns_from_meta_model(
                 meta_model=train_state.meta_model,
                 batch=meta_batch,
                 num_patterns=config.num_patterns_per_batch,
@@ -677,6 +718,11 @@ def evaluate_meta(
             grid_width=config.grid_width,
             few_shot_train_batch=few_shot_train_batch,
             meta_model=train_state.meta_model if config.use_few_shot else None,
+            h_cycles=h_values,
+            l_cycles=l_values,
+            hl_cost_lambda=config.hl_cost_lambda,
+            hl_cost_alpha=config.hl_cost_alpha,
+            hl_cost_beta=config.hl_cost_beta,
         )
         if config.device == "cuda":
             torch.cuda.synchronize()  # Ensure GPU operations complete

@@ -60,6 +60,12 @@ class MetaTRMConfig(BaseModel):
     aug_slots: int = 6   # 3x2 grid
     choices_per_slot: int = 2
 
+    # Allowed cycle choices for base TRM (discrete sets, enforce bounds here)
+    # H_cycles ∈ h_cycle_choices, e.g., [1, 2, 3]
+    # L_cycles ∈ l_cycle_choices, e.g., [1, 2, 3, 4, 5, 6]
+    h_cycle_choices: List[int] = [1, 2, 3]
+    l_cycle_choices: List[int] = [1, 2, 3, 4, 5, 6]
+
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     forward_dtype: str = "bfloat16"
@@ -195,6 +201,17 @@ class MetaTRMInner(nn.Module):
             self.config.choices_per_slot,
             bias=False,
         )
+        # Heads for H/L cycle choices (operate on pooled hidden state)
+        self.h_head = CastedLinear(
+            self.config.hidden_size,
+            len(self.config.h_cycle_choices),
+            bias=False,
+        )
+        self.l_head = CastedLinear(
+            self.config.hidden_size,
+            len(self.config.l_cycle_choices),
+            bias=False,
+        )
 
     def _input_embeddings(self, inputs: torch.Tensor, puzzle_identifiers: Optional[torch.Tensor]):
         embedding = self.embed_tokens(inputs.to(torch.int32))
@@ -233,7 +250,7 @@ class MetaTRMInner(nn.Module):
         self,
         carry: MetaTRMInnerCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[MetaTRMInnerCarry, torch.Tensor]:
+    ) -> Tuple[MetaTRMInnerCarry, torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -263,7 +280,13 @@ class MetaTRMInner(nn.Module):
         )
         aug_repr, _ = self.aug_pool(query=aug_queries, key=key_value, value=key_value)
         aug_logits = self.aug_head(aug_repr)
-        return new_carry, aug_logits
+
+        # Pool across augmentation slots to get a single representation per puzzle
+        pooled = aug_repr.mean(dim=1)  # [batch, hidden_size]
+        h_logits = self.h_head(pooled)
+        l_logits = self.l_head(pooled)
+
+        return new_carry, aug_logits, h_logits, l_logits
 
 
 class MetaTRM(nn.Module):
@@ -310,15 +333,47 @@ class MetaTRM(nn.Module):
         if batch_size == 0:
             # Return empty outputs
             device = batch["inputs"].device
-            empty_aug_logits = torch.empty((0, self.config.aug_slots, self.config.choices_per_slot), device=device, dtype=self.inner.forward_dtype)
-            outputs: Dict[str, torch.Tensor] = {"aug_logits": empty_aug_logits}
+            empty_aug_logits = torch.empty(
+                (0, self.config.aug_slots, self.config.choices_per_slot),
+                device=device,
+                dtype=self.inner.forward_dtype,
+            )
+            empty_h_logits = torch.empty(
+                (0, len(self.config.h_cycle_choices)),
+                device=device,
+                dtype=self.inner.forward_dtype,
+            )
+            empty_l_logits = torch.empty(
+                (0, len(self.config.l_cycle_choices)),
+                device=device,
+                dtype=self.inner.forward_dtype,
+            )
+            outputs: Dict[str, torch.Tensor] = {
+                "aug_logits": empty_aug_logits,
+                "h_logits": empty_h_logits,
+                "l_logits": empty_l_logits,
+            }
             outputs["sampled_patterns"] = []
+            outputs["sampled_H_values"] = torch.empty((0,), device=device, dtype=torch.long)
+            outputs["sampled_L_values"] = torch.empty((0,), device=device, dtype=torch.long)
+            outputs["sampled_H_log_probs"] = torch.empty(
+                (0,), device=device, dtype=self.inner.forward_dtype
+            )
+            outputs["sampled_L_log_probs"] = torch.empty(
+                (0,), device=device, dtype=self.inner.forward_dtype
+            )
             return MetaTRMCarry(carry.inner_carry, batch), outputs
         
         new_current_data = {k: batch[k] for k in batch}
-        new_inner_carry, aug_logits = self.inner(carry.inner_carry, new_current_data)
+        new_inner_carry, aug_logits, h_logits, l_logits = self.inner(
+            carry.inner_carry, new_current_data
+        )
 
-        outputs: Dict[str, torch.Tensor] = {"aug_logits": aug_logits}
+        outputs: Dict[str, torch.Tensor] = {
+            "aug_logits": aug_logits,
+            "h_logits": h_logits,
+            "l_logits": l_logits,
+        }
 
         if greedy:
             indices = greedy_indices_from_logits(aug_logits)
@@ -326,11 +381,66 @@ class MetaTRM(nn.Module):
             outputs["greedy_grid"] = indices_to_grid_tensor(indices)
             outputs["greedy_patterns"] = indices_to_pattern_strings(indices)
         elif sample:
-            sampled_indices, log_probs = sample_indices_from_logits(aug_logits, temperature=temperature)
+            sampled_indices, slot_log_probs = sample_indices_from_logits(
+                aug_logits, temperature=temperature
+            )
             outputs["sampled_indices"] = sampled_indices
-            outputs["sampled_log_probs"] = log_probs
+            outputs["sampled_log_probs"] = slot_log_probs
             outputs["sampled_grid"] = indices_to_grid_tensor(sampled_indices)
             outputs["sampled_patterns"] = indices_to_pattern_strings(sampled_indices)
+
+            # Sample H-cycles
+            h_probs = torch.softmax(h_logits, dim=-1)
+            h_probs = torch.nan_to_num(
+                h_probs,
+                nan=1.0 / max(h_logits.shape[-1], 1),
+                posinf=1.0,
+                neginf=0.0,
+            )
+            h_probs = h_probs / h_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            h_indices = torch.multinomial(h_probs, num_samples=1).squeeze(-1)
+            h_log_probs = torch.log(
+                h_probs.gather(dim=-1, index=h_indices.unsqueeze(-1))
+                .squeeze(-1)
+                .clamp_min(1e-8)
+            )
+
+            # Sample L-cycles
+            l_probs = torch.softmax(l_logits, dim=-1)
+            l_probs = torch.nan_to_num(
+                l_probs,
+                nan=1.0 / max(l_logits.shape[-1], 1),
+                posinf=1.0,
+                neginf=0.0,
+            )
+            l_probs = l_probs / l_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            l_indices = torch.multinomial(l_probs, num_samples=1).squeeze(-1)
+            l_log_probs = torch.log(
+                l_probs.gather(dim=-1, index=l_indices.unsqueeze(-1))
+                .squeeze(-1)
+                .clamp_min(1e-8)
+            )
+
+            # Map indices to concrete H/L values
+            h_choices = torch.tensor(
+                self.config.h_cycle_choices,
+                device=h_indices.device,
+                dtype=torch.long,
+            )
+            l_choices = torch.tensor(
+                self.config.l_cycle_choices,
+                device=l_indices.device,
+                dtype=torch.long,
+            )
+            sampled_H_values = h_choices[h_indices]
+            sampled_L_values = l_choices[l_indices]
+
+            outputs["sampled_H_indices"] = h_indices
+            outputs["sampled_L_indices"] = l_indices
+            outputs["sampled_H_values"] = sampled_H_values
+            outputs["sampled_L_values"] = sampled_L_values
+            outputs["sampled_H_log_probs"] = h_log_probs
+            outputs["sampled_L_log_probs"] = l_log_probs
 
         return MetaTRMCarry(new_inner_carry, new_current_data), outputs
 

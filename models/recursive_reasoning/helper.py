@@ -719,6 +719,11 @@ def compute_rewards_from_augmentations(
     grid_width: int = 9,
     few_shot_train_batch: Optional[Dict[str, torch.Tensor]] = None,
     meta_model: Optional["MetaTRM"] = None,
+    h_cycles: Optional[List[int]] = None,
+    l_cycles: Optional[List[int]] = None,
+    hl_cost_lambda: float = 0.01,
+    hl_cost_alpha: float = 1.0,
+    hl_cost_beta: float = 1.0,
 ) -> Tuple[
     List[float],
     float,
@@ -774,11 +779,22 @@ def compute_rewards_from_augmentations(
     rewards = []
     
     # 3. For each augmentation pattern:
-    for pattern in patterns:
+    for idx, pattern in enumerate(patterns):
         # 3a. Restore base model to original state
         base_model.load_state_dict(original_state)
         
-        # 3b. Get training batch (few-shot or augmented original)
+        # 3b. Select H/L cycles (if provided) and get training batch (few-shot or augmented original)
+        current_H: Optional[int] = None
+        current_L: Optional[int] = None
+        if h_cycles is not None and l_cycles is not None:
+            if idx < len(h_cycles) and idx < len(l_cycles):
+                current_H = int(h_cycles[idx])
+                current_L = int(l_cycles[idx])
+                if hasattr(base_model, "config"):
+                    base_model.config.H_cycles = current_H
+                    base_model.config.L_cycles = current_L
+
+        # 3c. Get training batch (few-shot or augmented original)
         if few_shot_train_batch is not None:
             # Check if batch is actually non-empty
             if few_shot_train_batch["inputs"].shape[0] == 0 or few_shot_train_batch["puzzle_identifiers"].shape[0] == 0:
@@ -807,7 +823,7 @@ def compute_rewards_from_augmentations(
             rewards.append(0.0)
             continue
         
-        # 3c. Fine-tune base TRM with LoRA on augmented data
+        # 3d. Fine-tune base TRM with LoRA on augmented data
         base_model.train()
         lora_params = get_lora_parameters(base_model)
         if len(lora_params) == 0:
@@ -831,7 +847,7 @@ def compute_rewards_from_augmentations(
                 optimizer.step()
                 optimizer.zero_grad()
         
-        # 3d. Evaluate on ORIGINAL batch (not augmented!)
+        # 3e. Evaluate on ORIGINAL batch (not augmented!)
         base_model.eval()
         eval_metrics = compute_base_trm_eval(
             base_model=base_model,
@@ -841,13 +857,26 @@ def compute_rewards_from_augmentations(
         val_loss = eval_metrics["loss"]
         pattern_eval_metrics.append(eval_metrics)
         
-        # 3e. Compute reward
+        # 3f. Compute reward
         if use_binary_reward:
             # Binary: 1 if improved, 0 if not
             reward = 1.0 if val_loss < baseline_loss else 0.0
         else:
-            # Continuous: -loss * scale (lower loss = higher reward)
-            reward = compute_reward(torch.tensor(val_loss), reward_scale=reward_scale)
+            # Continuous, compute-aware reward:
+            #   reward = (improvement in exact_accuracy or loss) - λ * (α * H + β * L)
+            baseline_exact = baseline_metrics.get("exact_accuracy")
+            pattern_exact = eval_metrics.get("exact_accuracy")
+            if baseline_exact is not None and pattern_exact is not None:
+                delta = float(pattern_exact) - float(baseline_exact)
+            else:
+                delta = float(baseline_loss) - float(val_loss)
+
+            if current_H is not None and current_L is not None:
+                cost = hl_cost_alpha * float(current_H) + hl_cost_beta * float(current_L)
+            else:
+                cost = 0.0
+
+            reward = delta - hl_cost_lambda * cost
         
         rewards.append(reward)
     
