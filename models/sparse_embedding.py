@@ -26,28 +26,16 @@ class CastedSparseEmbedding(nn.Module):
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
         
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            # Test mode, no gradient
-            return self.weights[inputs].to(self.cast_to)
-            
-        # Training mode, fill puzzle embedding from weights
-        with torch.no_grad():
-            # self.local_weights / self.local_ids are allocated with a *maximum*
-            # batch size (config.batch_size), but the actual runtime batch size
-            # can be smaller (e.g. after augmentations). Copy only into the
-            # active slice to avoid mismatched shapes like "32 vs 64".
-            batch = inputs.shape[0]
-            if batch > self.local_weights.shape[0]:
-                raise ValueError(
-                    f"CastedSparseEmbedding received batch size {batch} "
-                    f"larger than configured max batch size {self.local_weights.shape[0]}."
-                )
-            
-            self.local_weights[:batch].copy_(self.weights[inputs])
-            self.local_ids[:batch].copy_(inputs)
-        
-        # Only return the slice corresponding to the current batch.
-        return self.local_weights[:inputs.shape[0]].to(self.cast_to)
+        # For Self-Learning-TRM, we never train the sparse puzzle embeddings:
+        # the base TRM is loaded from a checkpoint and puzzle_emb weights are frozen.
+        # That means we don't need the special "local" buffers or custom optimizer
+        # behavior here; we can safely just index into the global weights for
+        # all modes (train/eval) without any fixed batch-size assumptions.
+        #
+        # This removes shape constraints like "batch must equal configured
+        # batch_size", which previously caused runtime errors when augmentation
+        # changed the effective batch size.
+        return self.weights[inputs].to(self.cast_to)
 
 
 class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
