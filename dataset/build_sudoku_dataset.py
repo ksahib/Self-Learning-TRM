@@ -133,16 +133,16 @@ def convert_subset(set_name: str, config: DataProcessConfig):
                 
                 assert len(q) == 81 and len(a) == 81
 
-                    inputs.append(
-                        np.frombuffer(
-                            q.replace(".", "0").encode(), dtype=np.uint8
-                        ).reshape(9, 9)
-                        - ord("0")
-                    )
-                    labels.append(
-                        np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9)
-                        - ord("0")
-                    )
+                inputs.append(
+                    np.frombuffer(
+                        q.replace(".", "0").encode(), dtype=np.uint8
+                    ).reshape(9, 9)
+                    - ord("0")
+                )
+                labels.append(
+                    np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9)
+                    - ord("0")
+                )
 
     # Subsampling: different logic for train vs test
     if set_name == "train" and config.subsample_size is not None:
