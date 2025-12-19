@@ -3,6 +3,7 @@ import os
 import csv
 import json
 import numpy as np
+import pandas as pd
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -16,14 +17,15 @@ cli = ArgParser()
 
 
 class DataProcessConfig(BaseModel):
-    # source_repo: str = "sapientinc/sudoku-extreme"
-    source_repo: str = "satwik77/sudoku-easy"
-    
+    # Default: original Sudoku Extreme dataset. Override to e.g. "LangAGI-Lab/Sudoku-Easy".
+    source_repo: str = "sapientinc/sudoku-extreme"
+
     output_dir: str = "data/sudoku-extreme-full"
 
     subsample_size: Optional[int] = None
     subsample_size_test: Optional[int] = None
     min_difficulty: Optional[int] = None
+    max_difficulty: Optional[int] = None
     num_aug: int = 0
 
 
@@ -61,19 +63,86 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
 
 
 def convert_subset(set_name: str, config: DataProcessConfig):
-    # Read CSV
+    # Read source dataset into lists of boards & solutions.
     inputs = []
     labels = []
-    
-    with open(hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
-        reader = csv.reader(csvfile)
-        next(reader)  # Skip header
-        for source, q, a, rating in reader:
-            if (config.min_difficulty is None) or (int(rating) >= config.min_difficulty):
-                assert len(q) == 81 and len(a) == 81
+
+    if config.source_repo == "LangAGI-Lab/Sudoku-Easy":
+        # LangAGI-Lab/Sudoku-Easy is stored as Parquet with columns:
+        # - initial_board: puzzle string ('.' for blanks)
+        # - solution: solution string
+        # - rows, cols: board dimensions (4x4 in this dataset)
+        #
+        # We mirror the earlier CSV logic but adapt to variable board size.
+        # Try common Parquet filenames for HF datasets.
+        parquet_candidates = [
+            f"{set_name}.parquet",
+            f"{set_name}-00000-of-00001.parquet",
+        ]
+        parquet_path = None
+        for fname in parquet_candidates:
+            try:
+                parquet_path = hf_hub_download(
+                    config.source_repo, fname, repo_type="dataset"
+                )
+                break
+            except Exception:
+                parquet_path = None
+        if parquet_path is None:
+            raise FileNotFoundError(
+                f"Could not find a Parquet file for split '{set_name}' "
+                f"in repo '{config.source_repo}'. Tried: {parquet_candidates}"
+            )
+
+        df = pd.read_parquet(parquet_path)
+        for _, row in df.iterrows():
+            q = row["initial_board"]
+            a = row["solution"]
+            rows_ = int(row["rows"])
+            cols_ = int(row["cols"])
+
+            assert rows_ == cols_, "Only square Sudokus are supported"
+            size = rows_
+            assert len(q) == size * size and len(a) == size * size
+
+            inputs.append(
+                np.frombuffer(q.replace(".", "0").encode(), dtype=np.uint8).reshape(
+                    size, size
+                )
+                - ord("0")
+            )
+            labels.append(
+                np.frombuffer(a.encode(), dtype=np.uint8).reshape(size, size)
+                - ord("0")
+            )
+    else:
+        # Original CSV-based format from sapientinc/sudoku-extreme (and similar).
+        with open(
+            hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"),
+            newline="",
+        ) as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip header
+            for source, q, a, rating in reader:
+                rating_int = int(rating)
+                # Filter by difficulty range
+                if config.min_difficulty is not None and rating_int < config.min_difficulty:
+                    continue
+                if config.max_difficulty is not None and rating_int > config.max_difficulty:
+                    continue
                 
-                inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
-                labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+                assert len(q) == 81 and len(a) == 81
+
+                    inputs.append(
+                        np.frombuffer(
+                            q.replace(".", "0").encode(), dtype=np.uint8
+                        ).reshape(9, 9)
+                        - ord("0")
+                    )
+                    labels.append(
+                        np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9)
+                        - ord("0")
+                    )
 
     # Subsampling: different logic for train vs test
     if set_name == "train" and config.subsample_size is not None:
@@ -136,9 +205,12 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     }
 
     # Metadata
+    seq_len = int(results["inputs"].shape[1])
+    vocab_size = int(results["inputs"].max()) + 1  # values already offset by +1
+
     metadata = PuzzleDatasetMetadata(
-        seq_len=81,
-        vocab_size=10 + 1,  # PAD + "0" ... "9"
+        seq_len=seq_len,
+        vocab_size=vocab_size,
         pad_id=0,
         ignore_label_id=0,
         blank_identifier_id=0,
