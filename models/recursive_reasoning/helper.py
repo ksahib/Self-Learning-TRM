@@ -776,6 +776,10 @@ def compute_rewards_from_augmentations(
     # 2. Save original model state (to restore after each fine-tuning)
     original_state = copy.deepcopy(base_model.state_dict())
     
+    # Store original H/L cycles for adaptive fine-tuning
+    original_H = base_model.config.H_cycles if hasattr(base_model, "config") else None
+    original_L = base_model.config.L_cycles if hasattr(base_model, "config") else None
+    
     rewards = []
     
     # 3. For each augmentation pattern:
@@ -786,11 +790,15 @@ def compute_rewards_from_augmentations(
         # 3b. Select H/L cycles (if provided) and get training batch (few-shot or augmented original)
         current_H: Optional[int] = None
         current_L: Optional[int] = None
+        cycles_changed = False
         if h_cycles is not None and l_cycles is not None:
             if idx < len(h_cycles) and idx < len(l_cycles):
                 current_H = int(h_cycles[idx])
                 current_L = int(l_cycles[idx])
                 if hasattr(base_model, "config"):
+                    # Check if cycles changed from original
+                    cycles_changed = (original_H is not None and current_H != original_H) or \
+                                   (original_L is not None and current_L != original_L)
                     base_model.config.H_cycles = current_H
                     base_model.config.L_cycles = current_L
 
@@ -823,7 +831,21 @@ def compute_rewards_from_augmentations(
             rewards.append(0.0)
             continue
         
-        # 3d. Fine-tune base TRM with LoRA on augmented data
+        # 3d. Fine-tune base TRM with LoRA
+        # Adaptive fine-tuning: increase steps when cycles decrease (model needs more adaptation)
+        effective_finetune_steps = num_finetune_steps
+        if cycles_changed and original_H is not None and original_L is not None and current_H is not None and current_L is not None:
+            # If cycles decreased, increase fine-tuning to help model adapt
+            cycles_decreased = (current_H < original_H) or (current_L < original_L)
+            if cycles_decreased:
+                # Scale fine-tuning steps based on how much cycles decreased
+                H_ratio = current_H / original_H if original_H > 0 else 1.0
+                L_ratio = current_L / original_L if original_L > 0 else 1.0
+                min_ratio = min(H_ratio, L_ratio)
+                # Increase fine-tuning when cycles are reduced (e.g., 2x if cycles halved)
+                effective_finetune_steps = int(num_finetune_steps / min_ratio)
+                effective_finetune_steps = max(effective_finetune_steps, num_finetune_steps * 2)  # At least 2x
+        
         base_model.train()
         lora_params = get_lora_parameters(base_model)
         if len(lora_params) == 0:
@@ -831,7 +853,28 @@ def compute_rewards_from_augmentations(
         
         optimizer = torch.optim.Adam(lora_params, lr=1e-7)
         
-        for _ in range(num_finetune_steps):
+        # Option 2: Fine-tune on original batch first when cycles change (helps model adapt to new cycles)
+        if cycles_changed:
+            # Pre-adaptation: fine-tune on original batch to help model adapt to new cycle counts
+            pre_adapt_steps = max(5, num_finetune_steps // 2)  # Use half of normal steps for pre-adaptation
+            for _ in range(pre_adapt_steps):
+                carry = base_model.initial_carry(original_batch)
+                carry, outputs = base_model(carry=carry, batch=original_batch)
+                
+                if "labels" in original_batch:
+                    logits = outputs["logits"]
+                    labels = original_batch["labels"].long()
+                    loss = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]),
+                        labels.reshape(-1),
+                        ignore_index=-100
+                    )
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+        
+        # Fine-tune on augmented data with adaptive steps
+        for _ in range(effective_finetune_steps):
             carry = base_model.initial_carry(aug_batch)
             carry, outputs = base_model(carry=carry, batch=aug_batch)
             
