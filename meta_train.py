@@ -470,6 +470,13 @@ def train_meta_batch(
     # 4. Compute policy gradient (REINFORCE)
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
     
+    # Normalize advantages to stabilize training (standard RL practice)
+    # This helps when continuous rewards have small magnitudes
+    if len(advantages) > 1:  # Only normalize if we have multiple patterns
+        advantages_std = advantages.std()
+        if advantages_std > 1e-8:  # Avoid division by zero
+            advantages = (advantages - advantages.mean()) / advantages_std
+    
     # Policy loss: -log_prob * advantage
     policy_loss = -(pattern_log_probs * advantages).mean()
     
@@ -773,8 +780,13 @@ def evaluate_meta(
             improvement = pattern_acc - baseline_acc
             loss_improvement = baseline_loss_val - pattern_loss  # Positive means loss decreased (better)
             
+            # Get H_cycle and L_cycle for this pattern
+            h_cycle = h_values[i] if i < len(h_values) else None
+            l_cycle = l_values[i] if i < len(l_values) else None
+            
             status = "✓" if improvement > 0 else "✗"
-            print(f"    Pattern {i+1} [{pattern}]: acc={pattern_acc:.4f} ({improvement:+.4f}), "
+            cycle_info = f"H={h_cycle},L={l_cycle}" if h_cycle is not None and l_cycle is not None else ""
+            print(f"    Pattern {i+1} [{pattern}] {cycle_info}: acc={pattern_acc:.4f} ({improvement:+.4f}), "
                   f"loss={pattern_loss:.4f} ({loss_improvement:+.4f}), reward={reward_val:.2f} {status}")
             
             if improvement > 0:
