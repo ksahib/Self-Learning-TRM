@@ -866,9 +866,18 @@ def compute_rewards_from_augmentations(
             #   reward = (improvement in exact_accuracy or loss) - λ * (α * H + β * L)
             baseline_exact = baseline_metrics.get("exact_accuracy")
             pattern_exact = eval_metrics.get("exact_accuracy")
+            
+            # Use exact_accuracy if at least one is non-zero
             if baseline_exact is not None and pattern_exact is not None:
-                delta = float(pattern_exact) - float(baseline_exact)
+                # If both are 0.0, loss provides better signal (loss DOES penalize enough!)
+                if abs(baseline_exact) < 1e-6 and abs(pattern_exact) < 1e-6:
+                    # Both are 0.0, use loss difference to properly penalize high loss
+                    delta = float(baseline_loss) - float(val_loss)
+                else:
+                    # At least one is non-zero, use exact_accuracy
+                    delta = float(pattern_exact) - float(baseline_exact)
             else:
+                # exact_accuracy not available, use loss
                 delta = float(baseline_loss) - float(val_loss)
 
             if current_H is not None and current_L is not None:
