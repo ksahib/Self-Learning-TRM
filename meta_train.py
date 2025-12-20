@@ -467,6 +467,49 @@ def train_meta_batch(
         mean_reward * (1 - config.baseline_momentum)
     )
     
+    # Print pattern information during training (same format as eval)
+    if train_state.step % max(config.log_interval, 1) == 0:  # Only print when logging to reduce noise
+        baseline_acc = baseline_metrics.get("exact_accuracy", 0.0)
+        baseline_loss_val = baseline_loss
+        
+        print(f"  Step {train_state.step} - Baseline: acc={baseline_acc:.4f}, loss={baseline_loss_val:.4f}")
+        
+        # Analyze each pattern's performance
+        improved_patterns = []
+        worsened_patterns = []
+        for i, (pattern, pattern_metric) in enumerate(zip(patterns, pattern_metrics)):
+            pattern_acc = pattern_metric.get("exact_accuracy", 0.0)
+            pattern_loss = pattern_metric.get("loss", float('inf'))
+            reward_val = rewards[i] if i < len(rewards) else 0.0
+            improvement = pattern_acc - baseline_acc
+            loss_improvement = baseline_loss_val - pattern_loss  # Positive means loss decreased (better)
+            
+            # Get H_cycle and L_cycle for this pattern
+            h_cycle = h_values[i] if i < len(h_values) else None
+            l_cycle = l_values[i] if i < len(l_values) else None
+            
+            status = "✓" if improvement > 0 else "✗"
+            cycle_info = f"H={h_cycle},L={l_cycle}" if h_cycle is not None and l_cycle is not None else ""
+            print(f"    Pattern {i+1} [{pattern}] {cycle_info}: acc={pattern_acc:.4f} ({improvement:+.4f}), "
+                  f"loss={pattern_loss:.4f} ({loss_improvement:+.4f}), reward={reward_val:.2f} {status}")
+            
+            if improvement > 0:
+                improved_patterns.append((pattern, improvement, pattern_acc))
+            elif improvement < 0:
+                worsened_patterns.append((pattern, improvement, pattern_acc))
+        
+        # Summary
+        if improved_patterns:
+            print(f"    ✓ Improved patterns ({len(improved_patterns)}): {[p[0] for p in improved_patterns]}")
+        if worsened_patterns:
+            print(f"    ✗ Worsened patterns ({len(worsened_patterns)}): {[p[0] for p in worsened_patterns]}")
+        
+        # Compute mean post-augmentation accuracy
+        post_accs = [pm.get("exact_accuracy", 0.0) for pm in pattern_metrics]
+        mean_post_acc = sum(post_accs) / len(post_accs) if len(post_accs) > 0 else 0.0
+        overall_improvement = mean_post_acc - baseline_acc
+        print(f"    Overall: mean_post_acc={mean_post_acc:.4f}, improvement={overall_improvement:+.4f}")
+    
     # 4. Compute policy gradient (REINFORCE)
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
     
