@@ -513,12 +513,13 @@ def train_meta_batch(
     # 4. Compute policy gradient (REINFORCE)
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
     
-    # Normalize advantages to stabilize training (standard RL practice)
-    # This helps when continuous rewards have small magnitudes
+    # Scale advantages to stabilize training (DO NOT center - preserves gradient signal)
+    # Centering to mean=0 kills the signal when rewards are similar
     if len(advantages) > 1:  # Only normalize if we have multiple patterns
         advantages_std = advantages.std()
         if advantages_std > 1e-8:  # Avoid division by zero
-            advantages = (advantages - advantages.mean()) / advantages_std
+            # Only scale by std, don't subtract mean (preserves relative differences)
+            advantages = advantages / advantages_std
     
     # Policy loss: -log_prob * advantage
     policy_loss = -(pattern_log_probs * advantages).mean()
