@@ -67,6 +67,16 @@ class MetaTrainConfig(BaseModel):
     # REINFORCE config
     baseline_momentum: float = 0.9
     entropy_coefficient: float = 0.01
+    # GRPO/PPO-style config
+    ppo_clip_epsilon: float = 0.2
+    use_kl_penalty: bool = True
+    kl_target: float = 0.01
+    kl_beta_init: float = 1.0
+    kl_adaptation_rate: float = 2.0
+    # Reference model update
+    use_ref_ema: bool = True
+    ref_ema_decay: float = 0.995
+    ref_update_interval: int = 500
     
     # Number of augmentation patterns to sample per batch
     num_patterns_per_batch: int = 3
@@ -109,9 +119,11 @@ class MetaTrainConfig(BaseModel):
 class MetaTrainState:
     meta_model: nn.Module
     meta_optimizer: torch.optim.Optimizer
+    meta_ref_model: nn.Module
     baseline_reward: float
     step: int
     total_steps: int
+    kl_beta: float
 
 
 def create_dataloader(
@@ -257,6 +269,11 @@ def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDataset
     # Create models
     meta_model = create_meta_model(config, train_metadata)
     meta_model = meta_model.to(config.device)
+    # Reference model (no gradients)
+    meta_ref_model = copy.deepcopy(meta_model).to(config.device)
+    meta_ref_model.eval()
+    for p in meta_ref_model.parameters():
+        p.requires_grad = False
     
     # Optimizer
     meta_optimizer = torch.optim.Adam(
@@ -269,9 +286,11 @@ def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDataset
     return MetaTrainState(
         meta_model=meta_model,
         meta_optimizer=meta_optimizer,
+        meta_ref_model=meta_ref_model,
         baseline_reward=0.0,
         step=0,
         total_steps=total_steps,
+        kl_beta=config.kl_beta_init,
     )
 
 
@@ -280,7 +299,19 @@ def sample_patterns_from_meta_model(
     batch: Dict[str, torch.Tensor],
     num_patterns: int,
     temperature: float = 1.0,
-) -> Tuple[List[str], torch.Tensor, List[int], List[int], torch.Tensor]:
+) -> Tuple[
+    List[str],
+    torch.Tensor,
+    List[int],
+    List[int],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """
     Sample multiple augmentation patterns and H/L cycle choices from the meta model.
     
@@ -298,6 +329,12 @@ def sample_patterns_from_meta_model(
         total_log_probs: Tensor of total log probabilities per pattern
             [num_patterns], equal to
             slot_log_probs[i].sum() + h_log_prob[i] + l_log_prob[i]
+        sampled_indices: Tensor of sampled augmentation indices [num_patterns, slots]
+        h_indices: Tensor of sampled H indices [num_patterns]
+        l_indices: Tensor of sampled L indices [num_patterns]
+        aug_logits: Raw augmentation logits [batch, slots, choices]
+        h_logits: Raw H-cycle logits [batch, choices]
+        l_logits: Raw L-cycle logits [batch, choices]
     """
     # Run meta model forward pass
     meta_carry = meta_model.initial_carry(batch)
@@ -308,6 +345,13 @@ def sample_patterns_from_meta_model(
         temperature=temperature,
     )
     
+    sampled_indices = meta_outputs.get("sampled_indices")
+    h_indices = meta_outputs.get("sampled_H_indices")
+    l_indices = meta_outputs.get("sampled_L_indices")
+    aug_logits = meta_outputs.get("aug_logits")
+    h_logits = meta_outputs.get("h_logits")
+    l_logits = meta_outputs.get("l_logits")
+
     # Get patterns, H/L values, and log probs from batch
     all_patterns = meta_outputs["sampled_patterns"]  # List[str], one per batch element
     all_slot_log_probs = meta_outputs["sampled_log_probs"]  # [batch, slots]
@@ -341,7 +385,19 @@ def sample_patterns_from_meta_model(
     slot_log_probs_tensor = torch.stack(slot_log_probs_list)  # [num_patterns, slots]
     total_log_probs_tensor = torch.stack(total_log_probs_list)  # [num_patterns]
     
-    return patterns, slot_log_probs_tensor, h_values, l_values, total_log_probs_tensor
+    return (
+        patterns,
+        slot_log_probs_tensor,
+        h_values,
+        l_values,
+        total_log_probs_tensor,
+        sampled_indices,
+        h_indices,
+        l_indices,
+        aug_logits,
+        h_logits,
+        l_logits,
+    )
 
 
 def train_meta_batch(
@@ -352,13 +408,14 @@ def train_meta_batch(
     val_batch: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
     """
-    Train one meta batch using REINFORCE algorithm.
+    Train one meta batch using GRPO/PPO-style policy gradient with a lagging
+    reference policy.
     
     Flow:
     1. Sample augmentation patterns from meta model
     2. Fine-tune base TRM on augmented data, evaluate on original
     3. Compute rewards
-    4. REINFORCE policy gradient update
+    4. GRPO/PPO policy gradient update with ratio clipping + KL-to-reference
     """
     train_state.step += 1
     
@@ -385,6 +442,12 @@ def train_meta_batch(
         h_values,
         l_values,
         pattern_log_probs,
+        sampled_indices,
+        h_indices,
+        l_indices,
+        aug_logits,
+        h_logits,
+        l_logits,
     ) = sample_patterns_from_meta_model(
         meta_model=train_state.meta_model,
         batch=meta_batch,
@@ -510,9 +573,37 @@ def train_meta_batch(
         overall_improvement = mean_post_acc - baseline_acc
         print(f"    Overall: mean_post_acc={mean_post_acc:.4f}, improvement={overall_improvement:+.4f}")
     
-    # 4. Compute policy gradient (REINFORCE)
+    # 4. Compute policy gradient (GRPO/PPO)
+    def _gather_log_probs(logits: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Utility to gather log probs for provided indices."""
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        return log_probs.gather(dim=-1, index=indices.unsqueeze(-1)).squeeze(-1)
+
+    # Compute reference log-probs for sampled actions using the lagging policy
+    with torch.no_grad():
+        ref_carry = train_state.meta_ref_model.initial_carry(meta_batch)
+        ref_carry, ref_outputs = train_state.meta_ref_model(
+            ref_carry,
+            meta_batch,
+            sample=False,
+            temperature=1.0,
+            greedy=False,
+        )
+        ref_aug_logits = ref_outputs["aug_logits"]
+        ref_h_logits = ref_outputs["h_logits"]
+        ref_l_logits = ref_outputs["l_logits"]
+
+        if sampled_indices is None or sampled_indices.numel() == 0:
+            ref_pattern_log_probs = torch.zeros_like(pattern_log_probs)
+        else:
+            ref_slot_log_probs = _gather_log_probs(ref_aug_logits, sampled_indices)
+            ref_h_log_probs = _gather_log_probs(ref_h_logits, h_indices)
+            ref_l_log_probs = _gather_log_probs(ref_l_logits, l_indices)
+            ref_pattern_log_probs = ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
+
+    # Ratios vs reference policy for PPO-style surrogate
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
-    
+
     # Scale advantages to stabilize training (DO NOT center - preserves gradient signal)
     # Centering to mean=0 kills the signal when rewards are similar
     if len(advantages) > 1:  # Only normalize if we have multiple patterns
@@ -520,23 +611,66 @@ def train_meta_batch(
         if advantages_std > 1e-8:  # Avoid division by zero
             # Only scale by std, don't subtract mean (preserves relative differences)
             advantages = advantages / advantages_std
-    
-    # Policy loss: -log_prob * advantage
-    policy_loss = -(pattern_log_probs * advantages).mean()
-    
+
+    ratio = torch.exp(pattern_log_probs - ref_pattern_log_probs.detach())
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - config.ppo_clip_epsilon, 1 + config.ppo_clip_epsilon) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+
+    # Clip fraction for logging
+    clip_frac = (ratio < (1 - config.ppo_clip_epsilon)).float().mean()
+    clip_frac += (ratio > (1 + config.ppo_clip_epsilon)).float().mean()
+    clip_frac = clip_frac.item() / 2.0
+
+    # KL penalty to reference policy (GRPO anchor)
+    def _categorical_kl(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
+        p_log = torch.log_softmax(p_logits.float(), dim=-1)
+        q_log = torch.log_softmax(q_logits.float(), dim=-1)
+        p_prob = torch.exp(p_log)
+        return (p_prob * (p_log - q_log)).sum(dim=-1)
+
+    kl_terms = []
+    if aug_logits is not None and aug_logits.numel() > 0:
+        kl_terms.append(_categorical_kl(aug_logits, ref_aug_logits).mean())
+    if h_logits is not None and h_logits.numel() > 0:
+        kl_terms.append(_categorical_kl(h_logits, ref_h_logits).mean())
+    if l_logits is not None and l_logits.numel() > 0:
+        kl_terms.append(_categorical_kl(l_logits, ref_l_logits).mean())
+
+    kl_value = torch.stack(kl_terms).mean() if len(kl_terms) > 0 else torch.tensor(0.0, device=config.device)
+    kl_loss = train_state.kl_beta * kl_value if config.use_kl_penalty else torch.tensor(0.0, device=config.device)
+
     # 5. Entropy regularization (encourage exploration)
     # Compute entropy from per-slot log_probs (augmentation choices only)
     probs = torch.exp(slot_log_probs)  # [num_patterns, slots]
     entropy = -(probs * slot_log_probs).sum(dim=-1).mean()  # Average entropy over patterns
     entropy_loss = -config.entropy_coefficient * entropy  # Negative because we want to maximize entropy
-    
-    total_loss = policy_loss + entropy_loss
-    
+
+    total_loss = policy_loss + entropy_loss + kl_loss
+
     # 6. Backprop and update meta model
     train_state.meta_optimizer.zero_grad()
     total_loss.backward()
     torch.nn.utils.clip_grad_norm_(train_state.meta_model.parameters(), max_norm=1.0)
     train_state.meta_optimizer.step()
+
+    # 6b. Adaptive KL scaling (optional)
+    if config.use_kl_penalty:
+        high_thresh = config.kl_target * 1.5
+        low_thresh = config.kl_target / 1.5
+        if kl_value.item() > high_thresh:
+            train_state.kl_beta *= config.kl_adaptation_rate
+        elif kl_value.item() < low_thresh:
+            train_state.kl_beta /= config.kl_adaptation_rate
+
+    # 6c. Update reference model (EMA or periodic hard copy)
+    if config.use_ref_ema:
+        decay = config.ref_ema_decay
+        with torch.no_grad():
+            for ref_p, p in zip(train_state.meta_ref_model.parameters(), train_state.meta_model.parameters()):
+                ref_p.data.mul_(decay).add_(p.data, alpha=1 - decay)
+    elif train_state.step % max(config.ref_update_interval, 1) == 0:
+        train_state.meta_ref_model.load_state_dict(train_state.meta_model.state_dict())
     
     # 7. Metrics
     trm_metric_keys = [
@@ -567,6 +701,11 @@ def train_meta_batch(
         "meta/entropy": entropy.item(),
         "meta/entropy_loss": entropy_loss.item(),
         "meta/total_loss": total_loss.item(),
+        "meta/ratio_mean": ratio.mean().item(),
+        "meta/ratio_std": ratio.std().item(),
+        "meta/clip_fraction": clip_frac,
+        "meta/kl_value": kl_value.item(),
+        "meta/kl_beta": train_state.kl_beta,
         "meta/mean_reward": mean_reward,
         "meta/baseline_reward": train_state.baseline_reward,
         "meta/baseline_loss": baseline_loss,
@@ -731,6 +870,12 @@ def evaluate_meta(
                 h_values,
                 l_values,
                 pattern_log_probs,
+                sampled_indices,
+                h_indices,
+                l_indices,
+                aug_logits,
+                h_logits,
+                l_logits,
             ) = sample_patterns_from_meta_model(
                 meta_model=train_state.meta_model,
                 batch=meta_batch,
