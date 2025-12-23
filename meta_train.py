@@ -332,9 +332,10 @@ def sample_patterns_from_meta_model(
         sampled_indices: Tensor of sampled augmentation indices [num_patterns, slots]
         h_indices: Tensor of sampled H indices [num_patterns]
         l_indices: Tensor of sampled L indices [num_patterns]
-        aug_logits: Raw augmentation logits [batch, slots, choices]
-        h_logits: Raw H-cycle logits [batch, choices]
-        l_logits: Raw L-cycle logits [batch, choices]
+        aug_logits: Raw augmentation logits for the chosen patterns
+            [num_patterns, slots, choices]
+        h_logits: Raw H-cycle logits for the chosen patterns [num_patterns, choices]
+        l_logits: Raw L-cycle logits for the chosen patterns [num_patterns, choices]
     """
     # Run meta model forward pass
     meta_carry = meta_model.initial_carry(batch)
@@ -345,12 +346,12 @@ def sample_patterns_from_meta_model(
         temperature=temperature,
     )
     
-    sampled_indices = meta_outputs.get("sampled_indices")
-    h_indices = meta_outputs.get("sampled_H_indices")
-    l_indices = meta_outputs.get("sampled_L_indices")
-    aug_logits = meta_outputs.get("aug_logits")
-    h_logits = meta_outputs.get("h_logits")
-    l_logits = meta_outputs.get("l_logits")
+    all_sampled_indices = meta_outputs.get("sampled_indices")  # [batch, slots]
+    all_h_indices = meta_outputs.get("sampled_H_indices")      # [batch]
+    all_l_indices = meta_outputs.get("sampled_L_indices")      # [batch]
+    all_aug_logits = meta_outputs.get("aug_logits")            # [batch, slots, choices]
+    all_h_logits = meta_outputs.get("h_logits")                # [batch, h_choices]
+    all_l_logits = meta_outputs.get("l_logits")                # [batch, l_choices]
 
     # Get patterns, H/L values, and log probs from batch
     all_patterns = meta_outputs["sampled_patterns"]  # List[str], one per batch element
@@ -366,6 +367,12 @@ def sample_patterns_from_meta_model(
     h_values: List[int] = []
     l_values: List[int] = []
     total_log_probs_list: List[torch.Tensor] = []
+    sampled_indices_list: List[torch.Tensor] = []
+    h_indices_list: List[torch.Tensor] = []
+    l_indices_list: List[torch.Tensor] = []
+    aug_logits_list: List[torch.Tensor] = []
+    h_logits_list: List[torch.Tensor] = []
+    l_logits_list: List[torch.Tensor] = []
     num_available = max(len(all_patterns), 1)
     
     for i in range(num_patterns):
@@ -381,9 +388,29 @@ def sample_patterns_from_meta_model(
         h_values.append(h_val)
         l_values.append(l_val)
         total_log_probs_list.append(slot_log_probs.sum() + h_lp + l_lp)
+        if all_sampled_indices is not None:
+            sampled_indices_list.append(all_sampled_indices[idx])
+        if all_h_indices is not None:
+            h_indices_list.append(all_h_indices[idx])
+        if all_l_indices is not None:
+            l_indices_list.append(all_l_indices[idx])
+        if all_aug_logits is not None:
+            aug_logits_list.append(all_aug_logits[idx])
+        if all_h_logits is not None:
+            h_logits_list.append(all_h_logits[idx])
+        if all_l_logits is not None:
+            l_logits_list.append(all_l_logits[idx])
     
     slot_log_probs_tensor = torch.stack(slot_log_probs_list)  # [num_patterns, slots]
     total_log_probs_tensor = torch.stack(total_log_probs_list)  # [num_patterns]
+    sampled_indices_tensor = (
+        torch.stack(sampled_indices_list) if len(sampled_indices_list) > 0 else None
+    )
+    h_indices_tensor = torch.stack(h_indices_list) if len(h_indices_list) > 0 else None
+    l_indices_tensor = torch.stack(l_indices_list) if len(l_indices_list) > 0 else None
+    aug_logits_tensor = torch.stack(aug_logits_list) if len(aug_logits_list) > 0 else None
+    h_logits_tensor = torch.stack(h_logits_list) if len(h_logits_list) > 0 else None
+    l_logits_tensor = torch.stack(l_logits_list) if len(l_logits_list) > 0 else None
     
     return (
         patterns,
@@ -391,12 +418,12 @@ def sample_patterns_from_meta_model(
         h_values,
         l_values,
         total_log_probs_tensor,
-        sampled_indices,
-        h_indices,
-        l_indices,
-        aug_logits,
-        h_logits,
-        l_logits,
+        sampled_indices_tensor,
+        h_indices_tensor,
+        l_indices_tensor,
+        aug_logits_tensor,
+        h_logits_tensor,
+        l_logits_tensor,
     )
 
 
@@ -596,9 +623,15 @@ def train_meta_batch(
         if sampled_indices is None or sampled_indices.numel() == 0:
             ref_pattern_log_probs = torch.zeros_like(pattern_log_probs)
         else:
-            ref_slot_log_probs = _gather_log_probs(ref_aug_logits, sampled_indices)
-            ref_h_log_probs = _gather_log_probs(ref_h_logits, h_indices)
-            ref_l_log_probs = _gather_log_probs(ref_l_logits, l_indices)
+            # Subselect ref logits for the same pattern indices we kept above
+            # so shapes match [num_patterns, ...]
+            ref_aug_logits_sel = ref_aug_logits[: sampled_indices.shape[0]]
+            ref_h_logits_sel = ref_h_logits[: h_indices.shape[0]]
+            ref_l_logits_sel = ref_l_logits[: l_indices.shape[0]]
+
+            ref_slot_log_probs = _gather_log_probs(ref_aug_logits_sel, sampled_indices)
+            ref_h_log_probs = _gather_log_probs(ref_h_logits_sel, h_indices)
+            ref_l_log_probs = _gather_log_probs(ref_l_logits_sel, l_indices)
             ref_pattern_log_probs = ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
 
     # Ratios vs reference policy for PPO-style surrogate
