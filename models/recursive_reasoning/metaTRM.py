@@ -433,7 +433,8 @@ class MetaTRM(nn.Module):
                 dtype=torch.long,
             )
             sampled_H_values = h_choices[h_indices]
-            sampled_L_values = l_choices[l_indices]
+            # Enforce L_cycles >= 2 by clamping sampled values
+            sampled_L_values = torch.clamp(l_choices[l_indices], min=2)
 
             outputs["sampled_H_indices"] = h_indices
             outputs["sampled_L_indices"] = l_indices

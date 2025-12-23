@@ -622,6 +622,9 @@ def train_meta_batch(
 
         if sampled_indices is None or sampled_indices.numel() == 0:
             ref_pattern_log_probs = torch.zeros_like(pattern_log_probs)
+            ref_aug_logits_sel = None
+            ref_h_logits_sel = None
+            ref_l_logits_sel = None
         else:
             # Subselect ref logits for the same pattern indices we kept above
             # so shapes match [num_patterns, ...]
@@ -632,7 +635,9 @@ def train_meta_batch(
             ref_slot_log_probs = _gather_log_probs(ref_aug_logits_sel, sampled_indices)
             ref_h_log_probs = _gather_log_probs(ref_h_logits_sel, h_indices)
             ref_l_log_probs = _gather_log_probs(ref_l_logits_sel, l_indices)
-            ref_pattern_log_probs = ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
+            ref_pattern_log_probs = (
+                ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
+            )
 
     # Ratios vs reference policy for PPO-style surrogate
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
@@ -663,12 +668,24 @@ def train_meta_batch(
         return (p_prob * (p_log - q_log)).sum(dim=-1)
 
     kl_terms = []
-    if aug_logits is not None and aug_logits.numel() > 0:
-        kl_terms.append(_categorical_kl(aug_logits, ref_aug_logits).mean())
-    if h_logits is not None and h_logits.numel() > 0:
-        kl_terms.append(_categorical_kl(h_logits, ref_h_logits).mean())
-    if l_logits is not None and l_logits.numel() > 0:
-        kl_terms.append(_categorical_kl(l_logits, ref_l_logits).mean())
+    if (
+        aug_logits is not None
+        and ref_aug_logits_sel is not None
+        and aug_logits.numel() > 0
+    ):
+        kl_terms.append(_categorical_kl(aug_logits, ref_aug_logits_sel).mean())
+    if (
+        h_logits is not None
+        and ref_h_logits_sel is not None
+        and h_logits.numel() > 0
+    ):
+        kl_terms.append(_categorical_kl(h_logits, ref_h_logits_sel).mean())
+    if (
+        l_logits is not None
+        and ref_l_logits_sel is not None
+        and l_logits.numel() > 0
+    ):
+        kl_terms.append(_categorical_kl(l_logits, ref_l_logits_sel).mean())
 
     kl_value = torch.stack(kl_terms).mean() if len(kl_terms) > 0 else torch.tensor(0.0, device=config.device)
     kl_loss = train_state.kl_beta * kl_value if config.use_kl_penalty else torch.tensor(0.0, device=config.device)
