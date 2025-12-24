@@ -815,21 +815,29 @@ def train_meta_batch(
     # Ratios vs reference policy for PPO-style surrogate
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
 
-    # Scale advantages to stabilize training (DO NOT center - preserves gradient signal)
-    # Centering to mean=0 kills the signal when rewards are similar
-    if len(advantages) > 1:  # Only normalize if we have multiple patterns
+    # Standard PPO advantage normalization: (adv - mean) / (std + eps)
+    # This centers advantages around 0 and scales them to unit variance, which is critical for PPO stability
+    if len(advantages) > 1:
+        advantages_mean = advantages.mean()
         advantages_std = advantages.std()
-        if advantages_std > 1e-8:  # Avoid division by zero
-            # Only scale by std, don't subtract mean (preserves relative differences)
-            advantages = advantages / advantages_std
-    
-    # Clamp advantages to prevent extreme values that cause numerical issues
-    advantages = torch.clamp(advantages, min=-10.0, max=10.0)
+        eps = 1e-8
+        if advantages_std > eps:
+            advantages = (advantages - advantages_mean) / (advantages_std + eps)
+        else:
+            # If std is too small, just center
+            advantages = advantages - advantages_mean
+    else:
+        # Single pattern: just center it
+        advantages = advantages - advantages.mean()
 
-    # Compute ratio with numerical stability: clamp log_prob difference to prevent exp overflow
+    # Clamp advantages after normalization (should be ~[-3, 3] after normalization, clamp to [-5, 5] for safety)
+    advantages = torch.clamp(advantages, min=-5.0, max=5.0)
+
+    # Compute ratio with proper clamping to keep ratios in reasonable range
     log_prob_diff = pattern_log_probs - ref_pattern_log_probs.detach()
-    # Clamp to prevent exp overflow (exp(20) ≈ 485 million, exp(-20) ≈ 2e-9)
-    log_prob_diff = torch.clamp(log_prob_diff, min=-20.0, max=20.0)
+    # Clamp log_prob_diff to keep ratios in reasonable range [exp(-2), exp(2)] ≈ [0.14, 7.4]
+    # This is much tighter than before and prevents ratio explosion
+    log_prob_diff = torch.clamp(log_prob_diff, min=-2.0, max=2.0)
     
     # Check for NaN/inf in log_probs and handle gracefully
     if torch.isnan(log_prob_diff).any() or torch.isinf(log_prob_diff).any():
@@ -839,9 +847,10 @@ def train_meta_batch(
     else:
         ratio = torch.exp(log_prob_diff)
     
-    # Additional safety: clamp ratio to reasonable range
-    ratio = torch.clamp(ratio, min=1e-8, max=1e8)
+    # Clamp ratio to reasonable range [0.1, 10] (much tighter than [1e-8, 1e8] to prevent huge losses)
+    ratio = torch.clamp(ratio, min=0.1, max=10.0)
     
+    # PPO clipped surrogate loss
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1 - config.ppo_clip_epsilon, 1 + config.ppo_clip_epsilon) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
