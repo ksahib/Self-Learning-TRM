@@ -638,6 +638,14 @@ def train_meta_batch(
             ref_pattern_log_probs = (
                 ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
             )
+    
+    # Safety check: ensure log_probs are finite before computing ratios
+    if torch.isnan(pattern_log_probs).any() or torch.isinf(pattern_log_probs).any():
+        print(f"Warning: NaN/inf in pattern_log_probs. Replacing with zeros.")
+        pattern_log_probs = torch.zeros_like(pattern_log_probs)
+    if torch.isnan(ref_pattern_log_probs).any() or torch.isinf(ref_pattern_log_probs).any():
+        print(f"Warning: NaN/inf in ref_pattern_log_probs. Replacing with zeros.")
+        ref_pattern_log_probs = torch.zeros_like(ref_pattern_log_probs)
 
     # Ratios vs reference policy for PPO-style surrogate
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
@@ -649,11 +657,34 @@ def train_meta_batch(
         if advantages_std > 1e-8:  # Avoid division by zero
             # Only scale by std, don't subtract mean (preserves relative differences)
             advantages = advantages / advantages_std
+    
+    # Clamp advantages to prevent extreme values that cause numerical issues
+    advantages = torch.clamp(advantages, min=-10.0, max=10.0)
 
-    ratio = torch.exp(pattern_log_probs - ref_pattern_log_probs.detach())
+    # Compute ratio with numerical stability: clamp log_prob difference to prevent exp overflow
+    log_prob_diff = pattern_log_probs - ref_pattern_log_probs.detach()
+    # Clamp to prevent exp overflow (exp(20) ≈ 485 million, exp(-20) ≈ 2e-9)
+    log_prob_diff = torch.clamp(log_prob_diff, min=-20.0, max=20.0)
+    
+    # Check for NaN/inf in log_probs and handle gracefully
+    if torch.isnan(log_prob_diff).any() or torch.isinf(log_prob_diff).any():
+        # If we have invalid log_probs, use a safe fallback: ratio = 1.0 (no update)
+        print(f"Warning: NaN/inf detected in log_prob_diff. Using safe fallback.")
+        ratio = torch.ones_like(pattern_log_probs)
+    else:
+        ratio = torch.exp(log_prob_diff)
+    
+    # Additional safety: clamp ratio to reasonable range
+    ratio = torch.clamp(ratio, min=1e-8, max=1e8)
+    
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1 - config.ppo_clip_epsilon, 1 + config.ppo_clip_epsilon) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
+    
+    # Final safety check: if policy_loss is NaN/inf, use a small dummy loss
+    if torch.isnan(policy_loss) or torch.isinf(policy_loss):
+        print(f"Warning: policy_loss is NaN/inf. Using safe fallback loss.")
+        policy_loss = torch.tensor(0.0, device=config.device, requires_grad=True)
 
     # Clip fraction for logging
     clip_frac = (ratio < (1 - config.ppo_clip_epsilon)).float().mean()
@@ -662,10 +693,16 @@ def train_meta_batch(
 
     # KL penalty to reference policy (GRPO anchor)
     def _categorical_kl(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
-        p_log = torch.log_softmax(p_logits.float(), dim=-1)
-        q_log = torch.log_softmax(q_logits.float(), dim=-1)
-        p_prob = torch.exp(p_log)
-        return (p_prob * (p_log - q_log)).sum(dim=-1)
+        # Clamp logits to prevent numerical issues
+        p_logits_safe = torch.clamp(p_logits.float(), min=-50.0, max=50.0)
+        q_logits_safe = torch.clamp(q_logits.float(), min=-50.0, max=50.0)
+        p_log = torch.log_softmax(p_logits_safe, dim=-1)
+        q_log = torch.log_softmax(q_logits_safe, dim=-1)
+        p_prob = torch.exp(p_log).clamp(min=1e-8, max=1.0)
+        kl = (p_prob * (p_log - q_log)).sum(dim=-1)
+        # Clamp KL to reasonable range
+        kl = torch.clamp(kl, min=0.0, max=100.0)
+        return kl
 
     kl_terms = []
     if (
@@ -692,11 +729,21 @@ def train_meta_batch(
 
     # 5. Entropy regularization (encourage exploration)
     # Compute entropy from per-slot log_probs (augmentation choices only)
-    probs = torch.exp(slot_log_probs)  # [num_patterns, slots]
-    entropy = -(probs * slot_log_probs).sum(dim=-1).mean()  # Average entropy over patterns
+    # Clamp log_probs to prevent numerical issues
+    slot_log_probs_safe = torch.clamp(slot_log_probs, min=-50.0, max=0.0)  # log_probs should be <= 0
+    probs = torch.exp(slot_log_probs_safe).clamp(min=1e-8, max=1.0)  # [num_patterns, slots]
+    entropy = -(probs * slot_log_probs_safe).sum(dim=-1).mean()  # Average entropy over patterns
+    # Ensure entropy is finite
+    if torch.isnan(entropy) or torch.isinf(entropy):
+        entropy = torch.tensor(0.0, device=config.device)
     entropy_loss = -config.entropy_coefficient * entropy  # Negative because we want to maximize entropy
 
     total_loss = policy_loss + entropy_loss + kl_loss
+    
+    # Final safety check: ensure total_loss is finite
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        print(f"Warning: total_loss is NaN/inf. Using safe fallback loss.")
+        total_loss = torch.tensor(0.0, device=config.device, requires_grad=True)
 
     # 6. Backprop and update meta model
     train_state.meta_optimizer.zero_grad()
