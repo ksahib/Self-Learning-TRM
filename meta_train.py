@@ -73,7 +73,11 @@ class MetaTrainConfig(BaseModel):
     kl_target: float = 0.01
     kl_beta_init: float = 1.0
     kl_adaptation_rate: float = 2.0
-    # Reference model update
+    # Reference model config (for two-stage training)
+    use_reference_model: bool = False  # If False, use PPO-style (old_log_probs). If True, use reference model GRPO
+    reference_checkpoint: Optional[str] = None  # Load reference model from checkpoint (for stage 2)
+    switch_to_reference_at_step: Optional[int] = None  # Auto-switch to reference model at this step (None = manual)
+    # Reference model update (only used if use_reference_model=True)
     use_ref_ema: bool = True
     ref_ema_decay: float = 0.995
     ref_update_interval: int = 500
@@ -119,7 +123,7 @@ class MetaTrainConfig(BaseModel):
 class MetaTrainState:
     meta_model: nn.Module
     meta_optimizer: torch.optim.Optimizer
-    meta_ref_model: nn.Module
+    meta_ref_model: Optional[nn.Module]  # Optional: only created if use_reference_model=True
     baseline_reward: float
     step: int
     total_steps: int
@@ -269,11 +273,42 @@ def init_meta_train_state(config: MetaTrainConfig, train_metadata: PuzzleDataset
     # Create models
     meta_model = create_meta_model(config, train_metadata)
     meta_model = meta_model.to(config.device)
-    # Reference model (no gradients)
-    meta_ref_model = copy.deepcopy(meta_model).to(config.device)
-    meta_ref_model.eval()
-    for p in meta_ref_model.parameters():
-        p.requires_grad = False
+    
+    # Reference model (optional, only created if use_reference_model=True)
+    meta_ref_model = None
+    if config.use_reference_model:
+        if config.reference_checkpoint is not None:
+            # Load reference model from checkpoint (for stage 2 training)
+            print(f"Loading reference model from checkpoint: {config.reference_checkpoint}")
+            meta_ref_model = create_meta_model(config, train_metadata)
+            meta_ref_model = meta_ref_model.to(config.device)
+            state_dict = torch.load(config.reference_checkpoint, map_location=config.device)
+            meta_ref_model.load_state_dict(state_dict, strict=False)
+            print("Reference model loaded from checkpoint")
+        else:
+            # Create reference model as deep copy (for stage 1 or if no checkpoint provided)
+            meta_ref_model = copy.deepcopy(meta_model).to(config.device)
+            print("Reference model created as deep copy of current model")
+        
+        meta_ref_model.eval()
+        for p in meta_ref_model.parameters():
+            p.requires_grad = False
+        
+        # Initialize buffers with a dummy forward pass
+        with torch.no_grad():
+            dummy_batch = {
+                "inputs": torch.zeros(1, train_metadata.seq_len, dtype=torch.long, device=config.device),
+                "labels": torch.zeros(1, train_metadata.seq_len, dtype=torch.long, device=config.device),
+                "puzzle_identifiers": torch.zeros(1, dtype=torch.long, device=config.device),
+            }
+            try:
+                dummy_carry = meta_ref_model.initial_carry(dummy_batch)
+                _, _ = meta_ref_model(dummy_carry, dummy_batch, sample=False, temperature=1.0, greedy=False)
+                print("Reference model buffers initialized")
+            except Exception as e:
+                print(f"Warning: Could not initialize reference model buffers: {e}")
+    else:
+        print("Using PPO-style GRPO (no reference model)")
     
     # Optimizer
     meta_optimizer = torch.optim.Adam(
@@ -606,38 +641,168 @@ def train_meta_batch(
         log_probs = torch.log_softmax(logits.float(), dim=-1)
         return log_probs.gather(dim=-1, index=indices.unsqueeze(-1)).squeeze(-1)
 
-    # Compute reference log-probs for sampled actions using the lagging policy
-    with torch.no_grad():
-        ref_carry = train_state.meta_ref_model.initial_carry(meta_batch)
-        ref_carry, ref_outputs = train_state.meta_ref_model(
-            ref_carry,
-            meta_batch,
-            sample=False,
-            temperature=1.0,
-            greedy=False,
-        )
-        ref_aug_logits = ref_outputs["aug_logits"]
-        ref_h_logits = ref_outputs["h_logits"]
-        ref_l_logits = ref_outputs["l_logits"]
+    # Determine which mode to use: PPO-style (old_log_probs) or reference-model GRPO
+    should_use_reference = (
+        config.use_reference_model 
+        and train_state.meta_ref_model is not None
+        and (config.switch_to_reference_at_step is None or train_state.step >= config.switch_to_reference_at_step)
+    )
+    
+    # Store old_log_probs for PPO-style (always store, use if not using reference model)
+    old_log_probs = pattern_log_probs.detach()
+    
+    # Compute reference log-probs
+    if should_use_reference:
+        # Use reference model GRPO
+        use_current_as_ref = False
+        with torch.no_grad():
+            # Ensure reference model is in eval mode
+            train_state.meta_ref_model.eval()
+        
+        try:
+            ref_carry = train_state.meta_ref_model.initial_carry(meta_batch)
+            ref_carry, ref_outputs = train_state.meta_ref_model(
+                ref_carry,
+                meta_batch,
+                sample=False,
+                temperature=1.0,
+                greedy=False,
+            )
+            ref_aug_logits = ref_outputs.get("aug_logits")
+            ref_h_logits = ref_outputs.get("h_logits")
+            ref_l_logits = ref_outputs.get("l_logits")
+            
+            # Check if outputs are valid
+            if ref_aug_logits is None or ref_h_logits is None or ref_l_logits is None:
+                raise ValueError("Reference model returned None logits")
+            if torch.isnan(ref_aug_logits).any() or torch.isnan(ref_h_logits).any() or torch.isnan(ref_l_logits).any():
+                raise ValueError("Reference model returned NaN logits")
+        except Exception as e:
+            if train_state.step == 1:
+                print(f"Warning: Reference model failed on first step: {e}. Using current model as reference (ratio=1.0).")
+                use_current_as_ref = True
+                # Use current model's logits as reference
+                ref_aug_logits = aug_logits.detach() if aug_logits is not None else None
+                ref_h_logits = h_logits.detach() if h_logits is not None else None
+                ref_l_logits = l_logits.detach() if l_logits is not None else None
+            else:
+                print(f"Warning: Reference model forward pass failed: {e}. Using zeros for ref log_probs.")
+                ref_aug_logits = None
+                ref_h_logits = None
+                ref_l_logits = None
+        
+        # Check for NaN/inf in reference logits
+        if ref_aug_logits is not None:
+            if torch.isnan(ref_aug_logits).any() or torch.isinf(ref_aug_logits).any():
+                print(f"Warning: NaN/inf in ref_aug_logits. Replacing with zeros.")
+                ref_aug_logits = torch.zeros_like(ref_aug_logits)
+        if ref_h_logits is not None:
+            if torch.isnan(ref_h_logits).any() or torch.isinf(ref_h_logits).any():
+                print(f"Warning: NaN/inf in ref_h_logits. Replacing with zeros.")
+                ref_h_logits = torch.zeros_like(ref_h_logits)
+        if ref_l_logits is not None:
+            if torch.isnan(ref_l_logits).any() or torch.isinf(ref_l_logits).any():
+                print(f"Warning: NaN/inf in ref_l_logits. Replacing with zeros.")
+                ref_l_logits = torch.zeros_like(ref_l_logits)
 
-        if sampled_indices is None or sampled_indices.numel() == 0:
+        if use_current_as_ref:
+            # On first step if ref model fails, use current model's log_probs as reference (ratio = 1.0)
+            ref_pattern_log_probs = pattern_log_probs.detach()
+            ref_aug_logits_sel = aug_logits.detach() if aug_logits is not None else None
+            ref_h_logits_sel = h_logits.detach() if h_logits is not None else None
+            ref_l_logits_sel = l_logits.detach() if l_logits is not None else None
+        elif sampled_indices is None or sampled_indices.numel() == 0:
             ref_pattern_log_probs = torch.zeros_like(pattern_log_probs)
+            ref_aug_logits_sel = None
+            ref_h_logits_sel = None
+            ref_l_logits_sel = None
+        elif ref_aug_logits is None or ref_h_logits is None or ref_l_logits is None:
+            # If reference model failed, use zeros
+            num_patterns = pattern_log_probs.shape[0]
+            ref_pattern_log_probs = torch.zeros(num_patterns, device=config.device)
             ref_aug_logits_sel = None
             ref_h_logits_sel = None
             ref_l_logits_sel = None
         else:
             # Subselect ref logits for the same pattern indices we kept above
             # so shapes match [num_patterns, ...]
-            ref_aug_logits_sel = ref_aug_logits[: sampled_indices.shape[0]]
-            ref_h_logits_sel = ref_h_logits[: h_indices.shape[0]]
-            ref_l_logits_sel = ref_l_logits[: l_indices.shape[0]]
+            num_patterns = sampled_indices.shape[0]
+            # Ensure we don't index beyond available logits
+            batch_size = ref_aug_logits.shape[0]
+            num_to_use = min(num_patterns, batch_size)
+            ref_aug_logits_sel = ref_aug_logits[:num_to_use]
+            ref_h_logits_sel = ref_h_logits[:num_to_use]
+            ref_l_logits_sel = ref_l_logits[:num_to_use]
+            
+            # If we need more patterns than available, pad with zeros
+            if num_to_use < num_patterns:
+                pad_size = num_patterns - num_to_use
+                ref_aug_logits_sel = torch.cat([
+                    ref_aug_logits_sel,
+                    torch.zeros(pad_size, *ref_aug_logits_sel.shape[1:], device=ref_aug_logits_sel.device, dtype=ref_aug_logits_sel.dtype)
+                ], dim=0)
+                ref_h_logits_sel = torch.cat([
+                    ref_h_logits_sel,
+                    torch.zeros(pad_size, *ref_h_logits_sel.shape[1:], device=ref_h_logits_sel.device, dtype=ref_h_logits_sel.dtype)
+                ], dim=0)
+                ref_l_logits_sel = torch.cat([
+                    ref_l_logits_sel,
+                    torch.zeros(pad_size, *ref_l_logits_sel.shape[1:], device=ref_l_logits_sel.device, dtype=ref_l_logits_sel.dtype)
+                ], dim=0)
 
-            ref_slot_log_probs = _gather_log_probs(ref_aug_logits_sel, sampled_indices)
-            ref_h_log_probs = _gather_log_probs(ref_h_logits_sel, h_indices)
-            ref_l_log_probs = _gather_log_probs(ref_l_logits_sel, l_indices)
-            ref_pattern_log_probs = (
-                ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
-            )
+            # Compute reference log_probs with safety checks
+            try:
+                if ref_aug_logits_sel is not None and sampled_indices is not None:
+                    # Clamp indices to valid range
+                    max_idx = ref_aug_logits_sel.shape[-1] - 1
+                    sampled_indices_safe = torch.clamp(sampled_indices, min=0, max=max_idx)
+                    ref_slot_log_probs = _gather_log_probs(ref_aug_logits_sel, sampled_indices_safe)
+                    # Check for NaN/inf
+                    if torch.isnan(ref_slot_log_probs).any() or torch.isinf(ref_slot_log_probs).any():
+                        print(f"Warning: NaN/inf in ref_slot_log_probs. Replacing with zeros.")
+                        ref_slot_log_probs = torch.zeros_like(ref_slot_log_probs)
+                else:
+                    ref_slot_log_probs = torch.zeros(num_patterns, device=config.device)
+                
+                if ref_h_logits_sel is not None and h_indices is not None:
+                    max_idx = ref_h_logits_sel.shape[-1] - 1
+                    h_indices_safe = torch.clamp(h_indices, min=0, max=max_idx)
+                    ref_h_log_probs = _gather_log_probs(ref_h_logits_sel, h_indices_safe)
+                    if torch.isnan(ref_h_log_probs).any() or torch.isinf(ref_h_log_probs).any():
+                        print(f"Warning: NaN/inf in ref_h_log_probs. Replacing with zeros.")
+                        ref_h_log_probs = torch.zeros_like(ref_h_log_probs)
+                else:
+                    ref_h_log_probs = torch.zeros(num_patterns, device=config.device)
+                
+                if ref_l_logits_sel is not None and l_indices is not None:
+                    max_idx = ref_l_logits_sel.shape[-1] - 1
+                    l_indices_safe = torch.clamp(l_indices, min=0, max=max_idx)
+                    ref_l_log_probs = _gather_log_probs(ref_l_logits_sel, l_indices_safe)
+                    if torch.isnan(ref_l_log_probs).any() or torch.isinf(ref_l_log_probs).any():
+                        print(f"Warning: NaN/inf in ref_l_log_probs. Replacing with zeros.")
+                        ref_l_log_probs = torch.zeros_like(ref_l_log_probs)
+                else:
+                    ref_l_log_probs = torch.zeros(num_patterns, device=config.device)
+                
+                ref_pattern_log_probs = (
+                    ref_slot_log_probs.sum(dim=-1) + ref_h_log_probs + ref_l_log_probs
+                )
+                
+                # Final check on ref_pattern_log_probs
+                if torch.isnan(ref_pattern_log_probs).any() or torch.isinf(ref_pattern_log_probs).any():
+                    print(f"Warning: NaN/inf in ref_pattern_log_probs after sum. Replacing with zeros.")
+                    ref_pattern_log_probs = torch.zeros(num_patterns, device=config.device)
+            except Exception as e:
+                print(f"Warning: Error computing ref_pattern_log_probs: {e}. Using zeros.")
+                ref_pattern_log_probs = torch.zeros(num_patterns, device=config.device)
+    else:
+        # PPO-style: use stored old_log_probs (from when we sampled)
+        ref_pattern_log_probs = old_log_probs
+        ref_aug_logits_sel = None
+        ref_h_logits_sel = None
+        ref_l_logits_sel = None
+        if train_state.step == 1 or train_state.step % 100 == 0:
+            print(f"Using PPO-style GRPO (old_log_probs), step={train_state.step}")
     
     # Safety check: ensure log_probs are finite before computing ratios
     if torch.isnan(pattern_log_probs).any() or torch.isinf(pattern_log_probs).any():
@@ -691,41 +856,46 @@ def train_meta_batch(
     clip_frac += (ratio > (1 + config.ppo_clip_epsilon)).float().mean()
     clip_frac = clip_frac.item() / 2.0
 
-    # KL penalty to reference policy (GRPO anchor)
-    def _categorical_kl(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
-        # Clamp logits to prevent numerical issues
-        p_logits_safe = torch.clamp(p_logits.float(), min=-50.0, max=50.0)
-        q_logits_safe = torch.clamp(q_logits.float(), min=-50.0, max=50.0)
-        p_log = torch.log_softmax(p_logits_safe, dim=-1)
-        q_log = torch.log_softmax(q_logits_safe, dim=-1)
-        p_prob = torch.exp(p_log).clamp(min=1e-8, max=1.0)
-        kl = (p_prob * (p_log - q_log)).sum(dim=-1)
-        # Clamp KL to reasonable range
-        kl = torch.clamp(kl, min=0.0, max=100.0)
-        return kl
+    # KL penalty to reference policy (GRPO anchor) - only if using reference model
+    if should_use_reference and config.use_kl_penalty:
+        def _categorical_kl(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
+            # Clamp logits to prevent numerical issues
+            p_logits_safe = torch.clamp(p_logits.float(), min=-50.0, max=50.0)
+            q_logits_safe = torch.clamp(q_logits.float(), min=-50.0, max=50.0)
+            p_log = torch.log_softmax(p_logits_safe, dim=-1)
+            q_log = torch.log_softmax(q_logits_safe, dim=-1)
+            p_prob = torch.exp(p_log).clamp(min=1e-8, max=1.0)
+            kl = (p_prob * (p_log - q_log)).sum(dim=-1)
+            # Clamp KL to reasonable range
+            kl = torch.clamp(kl, min=0.0, max=100.0)
+            return kl
 
-    kl_terms = []
-    if (
-        aug_logits is not None
-        and ref_aug_logits_sel is not None
-        and aug_logits.numel() > 0
-    ):
-        kl_terms.append(_categorical_kl(aug_logits, ref_aug_logits_sel).mean())
-    if (
-        h_logits is not None
-        and ref_h_logits_sel is not None
-        and h_logits.numel() > 0
-    ):
-        kl_terms.append(_categorical_kl(h_logits, ref_h_logits_sel).mean())
-    if (
-        l_logits is not None
-        and ref_l_logits_sel is not None
-        and l_logits.numel() > 0
-    ):
-        kl_terms.append(_categorical_kl(l_logits, ref_l_logits_sel).mean())
+        kl_terms = []
+        if (
+            aug_logits is not None
+            and ref_aug_logits_sel is not None
+            and aug_logits.numel() > 0
+        ):
+            kl_terms.append(_categorical_kl(aug_logits, ref_aug_logits_sel).mean())
+        if (
+            h_logits is not None
+            and ref_h_logits_sel is not None
+            and h_logits.numel() > 0
+        ):
+            kl_terms.append(_categorical_kl(h_logits, ref_h_logits_sel).mean())
+        if (
+            l_logits is not None
+            and ref_l_logits_sel is not None
+            and l_logits.numel() > 0
+        ):
+            kl_terms.append(_categorical_kl(l_logits, ref_l_logits_sel).mean())
 
-    kl_value = torch.stack(kl_terms).mean() if len(kl_terms) > 0 else torch.tensor(0.0, device=config.device)
-    kl_loss = train_state.kl_beta * kl_value if config.use_kl_penalty else torch.tensor(0.0, device=config.device)
+        kl_value = torch.stack(kl_terms).mean() if len(kl_terms) > 0 else torch.tensor(0.0, device=config.device)
+        kl_loss = train_state.kl_beta * kl_value
+    else:
+        # No KL penalty in PPO-style mode
+        kl_value = torch.tensor(0.0, device=config.device)
+        kl_loss = torch.tensor(0.0, device=config.device)
 
     # 5. Entropy regularization (encourage exploration)
     # Compute entropy from per-slot log_probs (augmentation choices only)
@@ -751,8 +921,8 @@ def train_meta_batch(
     torch.nn.utils.clip_grad_norm_(train_state.meta_model.parameters(), max_norm=1.0)
     train_state.meta_optimizer.step()
 
-    # 6b. Adaptive KL scaling (optional)
-    if config.use_kl_penalty:
+    # 6b. Adaptive KL scaling (optional, only if using reference model)
+    if should_use_reference and config.use_kl_penalty:
         high_thresh = config.kl_target * 1.5
         low_thresh = config.kl_target / 1.5
         if kl_value.item() > high_thresh:
@@ -760,14 +930,15 @@ def train_meta_batch(
         elif kl_value.item() < low_thresh:
             train_state.kl_beta /= config.kl_adaptation_rate
 
-    # 6c. Update reference model (EMA or periodic hard copy)
-    if config.use_ref_ema:
-        decay = config.ref_ema_decay
-        with torch.no_grad():
-            for ref_p, p in zip(train_state.meta_ref_model.parameters(), train_state.meta_model.parameters()):
-                ref_p.data.mul_(decay).add_(p.data, alpha=1 - decay)
-    elif train_state.step % max(config.ref_update_interval, 1) == 0:
-        train_state.meta_ref_model.load_state_dict(train_state.meta_model.state_dict())
+    # 6c. Update reference model (EMA or periodic hard copy) - only if using reference model
+    if should_use_reference and train_state.meta_ref_model is not None:
+        if config.use_ref_ema:
+            decay = config.ref_ema_decay
+            with torch.no_grad():
+                for ref_p, p in zip(train_state.meta_ref_model.parameters(), train_state.meta_model.parameters()):
+                    ref_p.data.mul_(decay).add_(p.data, alpha=1 - decay)
+        elif train_state.step % max(config.ref_update_interval, 1) == 0:
+            train_state.meta_ref_model.load_state_dict(train_state.meta_model.state_dict())
     
     # 7. Metrics
     trm_metric_keys = [
@@ -808,6 +979,7 @@ def train_meta_batch(
         "meta/baseline_loss": baseline_loss,
         "meta/rewards": rewards,  # List of rewards
         "meta/step": train_state.step,
+        "meta/using_reference_model": float(should_use_reference),  # Track which mode we're using
         **trm_baseline_metrics,
         **trm_post_metrics,
     }
