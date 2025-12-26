@@ -37,6 +37,8 @@ class MetaTrainConfig(BaseModel):
     # Base model config
     base_checkpoint_path: str
     base_arch: Dict
+    minimal_base_arch: Optional[Dict] = None  # Minimal architecture (H=1, L=3) for base model
+    lora_dir: Optional[str] = None  # Directory containing pre-trained LoRAs
     
     # Data
     data_paths: List[str]
@@ -213,10 +215,17 @@ def create_meta_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMeta
 
 
 def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetadata):
-    """Load pretrained base TRM model."""
-    base_arch_cfg = dict(config.base_arch)
+    """Load pretrained base TRM model with minimal architecture."""
+    # Use minimal_base_arch if provided, otherwise fall back to base_arch
+    if config.minimal_base_arch is not None:
+        arch_cfg = dict(config.minimal_base_arch)
+        print("Using minimal_base_arch for base model")
+    else:
+        arch_cfg = dict(config.base_arch)
+        print("Using base_arch for base model (minimal_base_arch not specified)")
+    
     for reserved_key in ("batch_size", "vocab_size", "seq_len", "num_puzzle_identifiers", "causal"):
-        base_arch_cfg.pop(reserved_key, None)
+        arch_cfg.pop(reserved_key, None)
     
     # The base TRM uses CastedSparseEmbedding, which is configured with a fixed
     # max batch size. During meta-training we may create augmented batches
@@ -232,7 +241,7 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
     effective_batch_size = config.global_batch_size * max(max_aug_per_puzzle, max_few_shot)
 
     model_cfg = dict(
-        **base_arch_cfg,
+        **arch_cfg,
         batch_size=effective_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
@@ -240,10 +249,10 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
         causal=False,
     )
     
-    # Create base model
+    # Create base model with minimal architecture
     base_model = TinyRecursiveReasoningModel_ACTV1(model_cfg)
     
-    # Load checkpoint
+    # Load checkpoint (should be trained on minimal architecture)
     base_model = load_base_trm_checkpoint(
         checkpoint_path=config.base_checkpoint_path,
         model=base_model,
@@ -260,7 +269,10 @@ def load_base_model(config: MetaTrainConfig, train_metadata: PuzzleDatasetMetada
         if "lora_" not in name:
             param.requires_grad = False
     
-    print(f"Base model loaded. Trainable LoRA params: {sum(p.numel() for p in base_model.parameters() if p.requires_grad)}")
+    print(f"Base model loaded with architecture H_cycles={base_model.config.H_cycles}, L_cycles={base_model.config.L_cycles}")
+    print(f"Trainable LoRA params: {sum(p.numel() for p in base_model.parameters() if p.requires_grad)}")
+    if config.lora_dir:
+        print(f"LoRA directory: {config.lora_dir}")
     
     return base_model
 
@@ -580,6 +592,7 @@ def train_meta_batch(
         hl_cost_lambda=config.hl_cost_lambda,
         hl_cost_alpha=config.hl_cost_alpha,
         hl_cost_beta=config.hl_cost_beta,
+        lora_dir=config.lora_dir,
     )
     
     # rewards: List[float], e.g., [0.0, 1.0, 0.0]
@@ -1210,6 +1223,7 @@ def evaluate_meta(
             hl_cost_lambda=config.hl_cost_lambda,
             hl_cost_alpha=config.hl_cost_alpha,
             hl_cost_beta=config.hl_cost_beta,
+            lora_dir=config.lora_dir,
         )
         if config.device == "cuda":
             torch.cuda.synchronize()  # Ensure GPU operations complete

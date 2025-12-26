@@ -513,6 +513,97 @@ def get_lora_parameters(model: torch.nn.Module) -> List[torch.nn.Parameter]:
     return lora_params
 
 
+def get_lora_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Extract only LoRA parameters (lora_A, lora_B) from model state dict.
+    
+    This is used to save/load LoRA weights separately from base model weights.
+    
+    Args:
+        model: PyTorch model (should contain LoRACastedLinear layers)
+    
+    Returns:
+        Dictionary containing only LoRA parameters (lora_A and lora_B)
+    """
+    state_dict = model.state_dict()
+    lora_state_dict = {}
+    for name, param in state_dict.items():
+        if "lora_A" in name or "lora_B" in name:
+            lora_state_dict[name] = param
+    return lora_state_dict
+
+
+def save_lora_state_dict(lora_dict: Dict[str, torch.Tensor], filepath: str):
+    """
+    Save LoRA state dict to file.
+    
+    Args:
+        lora_dict: Dictionary containing LoRA parameters
+        filepath: Path to save the LoRA state dict
+    """
+    import os
+    os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
+    torch.save(lora_dict, filepath)
+
+
+def load_lora_state_dict(model: torch.nn.Module, filepath: str) -> torch.nn.Module:
+    """
+    Load LoRA state dict into model (only LoRA parameters).
+    
+    Args:
+        model: PyTorch model to load LoRA weights into
+        filepath: Path to LoRA state dict file
+    
+    Returns:
+        Model with loaded LoRA weights (same instance, modified in-place)
+    """
+    import os
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"LoRA file not found: {filepath}")
+    
+    lora_state_dict = torch.load(filepath, map_location="cpu")
+    
+    # Load only LoRA parameters
+    model_state_dict = model.state_dict()
+    for name, param in lora_state_dict.items():
+        if name in model_state_dict:
+            if "lora_A" in name or "lora_B" in name:
+                model_state_dict[name].copy_(param)
+            else:
+                raise ValueError(f"Unexpected non-LoRA parameter in LoRA state dict: {name}")
+        else:
+            raise ValueError(f"Parameter {name} not found in model")
+    
+    model.load_state_dict(model_state_dict, strict=False)
+    return model
+
+
+def load_architecture_lora(
+    model: torch.nn.Module,
+    h_cycles: int,
+    l_cycles: int,
+    lora_dir: str,
+) -> torch.nn.Module:
+    """
+    Load architecture-specific LoRA for given H_cycles and L_cycles.
+    
+    Constructs filename as lora_H{h_cycles}_L{l_cycles}.pth and loads it.
+    
+    Args:
+        model: PyTorch model to load LoRA into
+        h_cycles: H_cycles value for architecture
+        l_cycles: L_cycles value for architecture
+        lora_dir: Directory containing pre-trained LoRA files
+    
+    Returns:
+        Model with loaded LoRA weights (same instance, modified in-place)
+    """
+    import os
+    filename = f"lora_H{h_cycles}_L{l_cycles}.pth"
+    filepath = os.path.join(lora_dir, filename)
+    return load_lora_state_dict(model, filepath)
+
+
 def compute_base_trm_eval(
     base_model: "TinyRecursiveReasoningModel_ACTV1",
     batch: Dict[str, torch.Tensor],
@@ -724,6 +815,7 @@ def compute_rewards_from_augmentations(
     hl_cost_lambda: float = 0.01,
     hl_cost_alpha: float = 1.0,
     hl_cost_beta: float = 1.0,
+    lora_dir: Optional[str] = None,
 ) -> Tuple[
     List[float],
     float,
@@ -754,6 +846,8 @@ def compute_rewards_from_augmentations(
         few_shot_train_batch: Optional few-shot training batch (already augmented by FewShotDataset).
                              If provided, this is used for fine-tuning instead of applying patterns to original_batch.
         meta_model: Optional MetaTRM model (not used currently, but kept for future use)
+        lora_dir: Optional directory containing pre-trained LoRAs. If provided and architecture changes,
+                 will load architecture-specific LoRA from lora_dir/lora_H{H}_L{L}.pth
     
     Returns:
         rewards: List of reward values (one per pattern), e.g., [0.0, 1.0, 0.0]
@@ -787,7 +881,7 @@ def compute_rewards_from_augmentations(
         # 3a. Restore base model to original state
         base_model.load_state_dict(original_state)
         
-        # 3b. Select H/L cycles (if provided) and get training batch (few-shot or augmented original)
+        # 3b. Select H/L cycles (if provided) and load architecture-specific LoRA
         current_H: Optional[int] = None
         current_L: Optional[int] = None
         cycles_changed = False
@@ -801,6 +895,24 @@ def compute_rewards_from_augmentations(
                                    (original_L is not None and current_L != original_L)
                     base_model.config.H_cycles = current_H
                     base_model.config.L_cycles = current_L
+                    
+                    # Load architecture-specific LoRA if lora_dir is provided and architecture changed
+                    # Note: If architecture didn't change (minimal architecture), we use base model's LoRA
+                    if lora_dir is not None and cycles_changed:
+                        try:
+                            base_model = load_architecture_lora(
+                                base_model,
+                                h_cycles=current_H,
+                                l_cycles=current_L,
+                                lora_dir=lora_dir,
+                            )
+                            print(f"Loaded LoRA for H={current_H}, L={current_L} from {lora_dir}")
+                        except FileNotFoundError as e:
+                            print(f"Warning: LoRA file not found for H={current_H}, L={current_L}: {e}")
+                            print("Continuing without architecture-specific LoRA (using base model LoRA)")
+                        except Exception as e:
+                            print(f"Warning: Failed to load LoRA for H={current_H}, L={current_L}: {e}")
+                            print("Continuing without architecture-specific LoRA (using base model LoRA)")
 
         # 3c. Get training batch (few-shot or augmented original)
         if few_shot_train_batch is not None:

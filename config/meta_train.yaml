@@ -35,8 +35,30 @@ base_arch:
   halt_max_steps: 16
   no_ACT_continue: True
 
-# Base model checkpoint path
+# Minimal architecture for base model (H=1, L=3)
+# Base model will be loaded with this architecture, and LoRAs will be used for other architectures
+minimal_base_arch:
+  H_cycles: 1
+  L_cycles: 3
+  H_layers: 0
+  L_layers: 2
+  hidden_size: 512
+  num_heads: 8
+  expansion: 4
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  mlp_t: False
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+  halt_exploration_prob: 0.1
+  halt_max_steps: 16
+  no_ACT_continue: True
+
+# Base model checkpoint path (should be trained on minimal architecture)
 base_checkpoint_path: "step_21700"  # Path to pretrained base TRM checkpoint
+
+# LoRA directory (containing pre-trained LoRAs for different architectures)
+lora_dir: "loras/"  # Directory containing pre-trained LoRA files (e.g., lora_H3_L6.pth)
 
 # Data paths
 data_paths: ['data/arc-aug-1000']  # Training data
