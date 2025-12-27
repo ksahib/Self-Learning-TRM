@@ -32,6 +32,21 @@ def create_dataloader(
     seed: int = 0,
 ) -> Tuple[DataLoader, PuzzleDatasetMetadata]:
     """Create dataloader for training."""
+    # Verify data paths exist and have train/ subdirectory
+    for data_path in data_paths:
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(
+                f"Data path does not exist: {data_path}\n"
+                f"Expected structure: {data_path}/train/dataset.json"
+            )
+        train_path = os.path.join(data_path, "train", "dataset.json")
+        if not os.path.exists(train_path):
+            raise FileNotFoundError(
+                f"Dataset structure not found: {train_path}\n"
+                f"Expected: {data_path}/train/dataset.json\n"
+                f"Please ensure your dataset has a 'train' subdirectory with 'dataset.json'"
+            )
+    
     dataset_config = PuzzleDatasetConfig(
         seed=seed,
         dataset_paths=data_paths,
@@ -41,7 +56,7 @@ def create_dataloader(
         rank=0,
         num_replicas=1,
     )
-    dataset = PuzzleDataset(dataset_config)
+    dataset = PuzzleDataset(dataset_config, split="train")
     metadata = dataset.metadata
     
     dataloader = DataLoader(
