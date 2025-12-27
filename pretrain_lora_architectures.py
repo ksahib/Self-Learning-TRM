@@ -122,10 +122,17 @@ def train_lora_for_architecture(
     
     while step < num_steps:
         try:
-            batch = next(dataloader_iter)
+            data = next(dataloader_iter)
         except StopIteration:
             dataloader_iter = iter(dataloader)
-            batch = next(dataloader_iter)
+            data = next(dataloader_iter)
+        
+        # PuzzleDataset yields (set_name, batch, global_batch_size)
+        if isinstance(data, tuple) and len(data) == 3:
+            set_name, batch, global_batch_size = data
+        else:
+            # Fallback: assume it's already a batch dict
+            batch = data
         
         # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
