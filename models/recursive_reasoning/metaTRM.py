@@ -63,8 +63,8 @@ class MetaTRMConfig(BaseModel):
     # Allowed cycle choices for base TRM (discrete sets, enforce bounds here)
     # H_cycles ∈ h_cycle_choices, e.g., [1, 2, 3]
     # L_cycles ∈ l_cycle_choices, e.g., [1, 2, 3, 4, 5, 6]
-    h_cycle_choices: List[int] = [2, 3]
-    l_cycle_choices: List[int] = [3, 4, 5, 6]
+    h_cycle_choices: List[int] = [1,2, 3]
+    l_cycle_choices: List[int] = [1,2,3, 4, 5, 6]
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
