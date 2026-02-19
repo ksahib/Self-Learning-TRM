@@ -906,29 +906,29 @@ def compute_rewards_from_augmentations(
             reward = 1.0 if val_loss < baseline_loss else 0.0
         else:
             # Continuous, compute-aware reward:
-            #   reward = (improvement in exact_accuracy or loss) - λ * (α * H + β * L)
+            #   reward = delta - λ * (α * H + β * L)
+            # The cost term is only applied when there IS a positive accuracy
+            # improvement; otherwise the cost penalty dominates and the model
+            # simply learns to minimise H+L instead of finding good augmentations.
             baseline_exact = baseline_metrics.get("exact_accuracy")
             pattern_exact = eval_metrics.get("exact_accuracy")
             
-            # Use exact_accuracy if at least one is non-zero
             if baseline_exact is not None and pattern_exact is not None:
-                # If both are 0.0, loss provides better signal (loss DOES penalize enough!)
                 if abs(baseline_exact) < 1e-6 and abs(pattern_exact) < 1e-6:
-                    # Both are 0.0, use loss difference to properly penalize high loss
                     delta = float(baseline_loss) - float(val_loss)
                 else:
-                    # At least one is non-zero, use exact_accuracy
                     delta = float(pattern_exact) - float(baseline_exact)
             else:
-                # exact_accuracy not available, use loss
                 delta = float(baseline_loss) - float(val_loss)
 
-            if current_H is not None and current_L is not None:
+            # Only penalise compute cost when the augmentation actually helped;
+            # otherwise the cost term biases the model toward H=1,L=2 when all
+            # patterns perform equally poorly.
+            if delta > 0 and current_H is not None and current_L is not None:
                 cost = hl_cost_alpha * float(current_H) + hl_cost_beta * float(current_L)
+                reward = delta - hl_cost_lambda * cost
             else:
-                cost = 0.0
-
-            reward = delta - hl_cost_lambda * cost
+                reward = delta
         
         rewards.append(reward)
     

@@ -815,22 +815,10 @@ def train_meta_batch(
     # Ratios vs reference policy for PPO-style surrogate
     advantages = rewards_tensor - train_state.baseline_reward  # [num_patterns]
 
-    # Standard PPO advantage normalization: (adv - mean) / (std + eps)
-    # This centers advantages around 0 and scales them to unit variance, which is critical for PPO stability
-    if len(advantages) > 1:
-        advantages_mean = advantages.mean()
-        advantages_std = advantages.std()
-        eps = 1e-8
-        if advantages_std > eps:
-            advantages = (advantages - advantages_mean) / (advantages_std + eps)
-        else:
-            # If std is too small, just center
-            advantages = advantages - advantages_mean
-    else:
-        # Single pattern: just center it
-        advantages = advantages - advantages.mean()
-
-    # Clamp advantages after normalization (should be ~[-3, 3] after normalization, clamp to [-5, 5] for safety)
+    # With small num_patterns (e.g. 3), per-batch (adv - mean) / std normalization
+    # destroys the absolute signal: when all patterns are equally bad the advantages
+    # become [0, 0, 0] and the model learns nothing.  Instead we only subtract the
+    # moving-average baseline (already done above) and apply a mild clamp.
     advantages = torch.clamp(advantages, min=-5.0, max=5.0)
 
     # Compute ratio with proper clamping to keep ratios in reasonable range
@@ -907,12 +895,32 @@ def train_meta_batch(
         kl_loss = torch.tensor(0.0, device=config.device)
 
     # 5. Entropy regularization (encourage exploration)
-    # Compute entropy from per-slot log_probs (augmentation choices only)
-    # Clamp log_probs to prevent numerical issues
-    slot_log_probs_safe = torch.clamp(slot_log_probs, min=-50.0, max=0.0)  # log_probs should be <= 0
-    probs = torch.exp(slot_log_probs_safe).clamp(min=1e-8, max=1.0)  # [num_patterns, slots]
-    entropy = -(probs * slot_log_probs_safe).sum(dim=-1).mean()  # Average entropy over patterns
-    # Ensure entropy is finite
+    # Compute proper categorical entropy over the FULL distribution for all
+    # three decision heads (augmentation slots, H-cycles, L-cycles).
+    # Previous implementation incorrectly used only the selected action's
+    # log-prob which underestimates entropy and ignores H/L heads entirely.
+    def _categorical_entropy(logits: torch.Tensor) -> torch.Tensor:
+        """H(p) = -sum(p_i * log p_i) from full logit distribution."""
+        log_p = torch.log_softmax(logits.float(), dim=-1)
+        p = torch.exp(log_p).clamp(min=1e-8, max=1.0)
+        ent = -(p * log_p).sum(dim=-1)
+        return ent  # [...] same leading dims as logits minus last
+
+    entropy_terms = []
+    if aug_logits is not None and aug_logits.numel() > 0:
+        # aug_logits: [num_patterns, slots, choices] → entropy per slot, then mean
+        entropy_terms.append(_categorical_entropy(aug_logits).mean())
+    if h_logits is not None and h_logits.numel() > 0:
+        # h_logits: [num_patterns, h_choices]
+        entropy_terms.append(_categorical_entropy(h_logits).mean())
+    if l_logits is not None and l_logits.numel() > 0:
+        # l_logits: [num_patterns, l_choices]
+        entropy_terms.append(_categorical_entropy(l_logits).mean())
+
+    if len(entropy_terms) > 0:
+        entropy = torch.stack(entropy_terms).mean()
+    else:
+        entropy = torch.tensor(0.0, device=config.device)
     if torch.isnan(entropy) or torch.isinf(entropy):
         entropy = torch.tensor(0.0, device=config.device)
     entropy_loss = -config.entropy_coefficient * entropy  # Negative because we want to maximize entropy
